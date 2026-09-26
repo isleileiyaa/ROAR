@@ -1,0 +1,2704 @@
+import copy
+import logging
+import warnings
+from dataclasses import dataclass, fields
+from typing import List, Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoConfig
+from transformers.models.t5.modeling_t5 import (
+    ACT2FN,
+    T5Config,
+    T5LayerNorm,
+    T5PreTrainedModel,
+    T5Stack,
+)
+from transformers.utils import ModelOutput
+
+from .base import BaseChronosPipeline, ForecastType
+
+logger = logging.getLogger("autogluon.timeseries.models.chronos")
+
+
+@dataclass
+class ChronosBoltConfig:
+    context_length: int
+    prediction_length: int
+    input_patch_size: int
+    input_patch_stride: int
+    quantiles: List[float]
+    use_reg_token: bool = False
+
+
+@dataclass
+class ChronosBoltOutput(ModelOutput):
+    loss: Optional[torch.Tensor] = None
+    total_loss: Optional[torch.Tensor] = None
+    loss_forecast: Optional[torch.Tensor] = None
+    # RIDDE_新版目标函数与最终实验方案 Stage 4 (L_TRR/CVaR)：每个样本自己的预测损失
+    # (batch内reduce之前那一步)，形状 (batch_size,)，训练图完整保留(不 detach)。
+    # 这是在 loss_forecast(对batch取mean之后的标量) 之前多存一份，供外面按环境分组
+    # 算 R_e^ret/R_e^0 用；对已有的 loss/loss_forecast 数值和所有旧 augment_mode
+    # 完全没有影响，纯增量字段。
+    loss_forecast_per_sample: Optional[torch.Tensor] = None
+    loss_cons: Optional[torch.Tensor] = None
+    loss_smooth: Optional[torch.Tensor] = None
+    loss_inv: Optional[torch.Tensor] = None
+    loss_dis: Optional[torch.Tensor] = None
+    loss_dis_output: Optional[torch.Tensor] = None
+    loss_ret: Optional[torch.Tensor] = None
+    loss_dyn: Optional[torch.Tensor] = None
+    loss_sem: Optional[torch.Tensor] = None
+    loss_xcov: Optional[torch.Tensor] = None
+    loss_ord: Optional[torch.Tensor] = None
+    loss_delta: Optional[torch.Tensor] = None
+    # FINAL_MSE_OBJECTIVE_PATCH_V1: auxiliary accuracy loss on the fused median forecast.
+    loss_final_mse: Optional[torch.Tensor] = None
+    loss_cos: Optional[torch.Tensor] = None
+    loss_gbal: Optional[torch.Tensor] = None
+    # RIDDE_新版目标函数与最终实验方案 Stage 3 (Dual+ERM): L_sep = L_xcov + beta_var*L_var
+    # (loss_xcov above is reused; loss_var is the new anti-collapse variance-floor term).
+    loss_var: Optional[torch.Tensor] = None
+    loss_sep: Optional[torch.Tensor] = None
+    # RIDDE_检索扰动相对风险目标 (rob_doc)：idf_trr_dualpath / idf_trr_dualpath_learnfuse
+    # 的 e_q、retrieved_y_enc(文档的 e_hat_k^r)、omega(ref_doc的omega_i,k，已squeeze成
+    # [batch,K])、以及跟fused_quantile_preds同一把尺子(instance_norm+padding之后)的
+    # target，供pretrain.py用model.dualpath_predict_with_pi在外部重跑轻量下游头算L_rob。
+    # 对其他augment_mode和已有数值零影响，纯增量字段。
+    aux_e_q_rob: Optional[torch.Tensor] = None
+    aux_retrieved_y_enc_rob: Optional[torch.Tensor] = None
+    aux_omega_rob: Optional[torch.Tensor] = None
+    aux_target_rob: Optional[torch.Tensor] = None
+    diag_cos_sim: Optional[torch.Tensor] = None
+    diag_gamma_mean: Optional[torch.Tensor] = None
+    diag_gamma_sat_frac: Optional[torch.Tensor] = None
+    diag_roughness_inv: Optional[torch.Tensor] = None
+    diag_roughness_dyn: Optional[torch.Tensor] = None
+    diag_energy_share_inv: Optional[torch.Tensor] = None
+    # Per-sample (B,) versions of the above, for post-hoc stratified analysis
+    # (e.g. c_i-quartile MSE/MAE breakdowns) that a batch-mean scalar can't support.
+    diag_c_i: Optional[torch.Tensor] = None
+    diag_gamma_per_sample: Optional[torch.Tensor] = None
+    diag_cos_sim_per_sample: Optional[torch.Tensor] = None
+    diag_roughness_inv_per_sample: Optional[torch.Tensor] = None
+    diag_roughness_dyn_per_sample: Optional[torch.Tensor] = None
+    diag_energy_share_per_sample: Optional[torch.Tensor] = None
+    # idf_clean_dis / idf_clean_dis_v3 / idf_clean_dis_v4(以及共享同一分支的
+    # idf_clean_dis_deepmlp)：不变头/动态头各自的完整分位数预测曲线(B, Q, pred_len)，
+    # 之前只在forward()内部用于算diag_roughness_*等标量诊断，从未对外暴露；其它
+    # augment_mode保持None，不影响任何已有loss/精度计算路径。
+    y_inv: Optional[torch.Tensor] = None
+    y_dyn: Optional[torch.Tensor] = None
+    use_disentangle_aux_loss: Optional[bool] = None
+    aux_loss_enabled: Optional[bool] = None
+    quantile_preds: Optional[torch.Tensor] = None
+    attentions: Optional[torch.Tensor] = None
+    cross_attentions: Optional[torch.Tensor] = None
+
+
+class Patch(nn.Module):
+    def __init__(self, patch_size: int, patch_stride: int) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.patch_stride = patch_stride
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        length = x.shape[-1]
+
+        if length % self.patch_size != 0:
+            padding_size = (
+                *x.shape[:-1],
+                self.patch_size - (length % self.patch_size),
+            )
+            padding = torch.full(size=padding_size, fill_value=torch.nan, dtype=x.dtype, device=x.device)
+            x = torch.concat((padding, x), dim=-1)
+
+        x = x.unfold(dimension=-1, size=self.patch_size, step=self.patch_stride)
+        return x
+
+    
+class InstanceNorm(nn.Module):
+    """
+    Instance Normalization with handling for constant inputs.
+    For constant inputs, the normalized output is set to 1, and inverse restores the original constant value.
+    """
+
+    def __init__(self, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        loc_scale: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if loc_scale is None:
+            # Compute loc and scale
+            loc = torch.nan_to_num(torch.nanmean(x, dim=-1, keepdim=True), nan=0.0)
+            scale = torch.nan_to_num(
+                (x - loc).square().nanmean(dim=-1, keepdim=True).sqrt(),
+                nan=1.0
+            )
+
+            # Detect constant inputs
+            is_constant = torch.all(x == x[..., :1], dim=-1, keepdim=True)  # Batch-wise constant input detection
+
+            # For constant inputs, set scale = 1
+            scale = torch.where(is_constant, torch.ones_like(scale), scale)
+        else:
+            loc, scale = loc_scale
+
+        # Normalize input
+        normalized = (x - loc) / scale
+
+        # For constant inputs, override normalized result to 1
+        is_constant = torch.all(x == x[..., :1], dim=-1, keepdim=True) if loc_scale is None else (scale == 1)
+        normalized = torch.where(is_constant, torch.ones_like(normalized), normalized)
+
+        return normalized, (loc, scale)
+
+    def inverse(self, x: torch.Tensor, loc_scale: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        loc, scale = loc_scale
+
+        # Detect constant inputs during inverse
+        is_constant = scale == 1
+
+        # Restore original values for constant inputs
+        original = torch.where(is_constant, loc, x * scale + loc)
+        return original
+
+
+
+class ResidualBlock(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        h_dim: int,
+        out_dim: int,
+        act_fn_name: str,
+        dropout_p: float = 0.0,
+        use_layer_norm: bool = False,
+    ) -> None:
+        super().__init__()
+
+        self.dropout = nn.Dropout(dropout_p)
+        self.hidden_layer = nn.Linear(in_dim, h_dim)
+        self.act = ACT2FN[act_fn_name]
+        self.output_layer = nn.Linear(h_dim, out_dim)
+        self.residual_layer = nn.Linear(in_dim, out_dim)
+
+        self.use_layer_norm = use_layer_norm
+        if use_layer_norm:
+            self.layer_norm = T5LayerNorm(out_dim)
+
+    def forward(self, x: torch.Tensor):
+        hid = self.act(self.hidden_layer(x))
+        out = self.dropout(self.output_layer(hid))
+        res = self.residual_layer(x)
+
+        out = out + res
+
+        if self.use_layer_norm:
+            return self.layer_norm(out)
+        return out
+
+
+class ChronosBoltModelForForecasting(T5PreTrainedModel):
+    _keys_to_ignore_on_load_missing = [
+        r"input_patch_embedding\.",
+        r"output_patch_embedding\.",
+    ]
+    _keys_to_ignore_on_load_unexpected = [r"lm_head.weight"]
+    _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight"]
+
+    def __init__(self, config: T5Config):
+        assert hasattr(config, "chronos_config"), "Not a Chronos config file"
+
+        super().__init__(config)
+        self.model_dim = config.d_model
+
+        # TODO: remove filtering eventually, added for backward compatibility
+        config_fields = {f.name for f in fields(ChronosBoltConfig)}
+        self.chronos_config = ChronosBoltConfig(
+            **{k: v for k, v in config.chronos_config.items() if k in config_fields}
+        )
+
+        # Only decoder_start_id (and optionally REG token)
+        if self.chronos_config.use_reg_token:
+            config.reg_token_id = 1
+
+        config.vocab_size = 2 if self.chronos_config.use_reg_token else 1
+        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+
+        # Input patch embedding layer
+        self.input_patch_embedding = ResidualBlock(
+            in_dim=self.chronos_config.input_patch_size * 2,
+            h_dim=config.d_ff,
+            out_dim=config.d_model,
+            act_fn_name=config.dense_act_fn,
+            dropout_p=config.dropout_rate,
+        )
+
+        # patching layer
+        self.patch = Patch(
+            patch_size=self.chronos_config.input_patch_size,
+            patch_stride=self.chronos_config.input_patch_stride,
+        )
+
+        # instance normalization, also referred to as "scaling" in Chronos and GluonTS
+        self.instance_norm = InstanceNorm()
+
+        encoder_config = copy.deepcopy(config)
+        encoder_config.is_decoder = False
+        encoder_config.use_cache = False
+        encoder_config.is_encoder_decoder = False
+        self.encoder = T5Stack(encoder_config, self.shared)
+
+        self._init_decoder(config)
+
+        self.num_quantiles = len(self.chronos_config.quantiles)
+        quantiles = torch.tensor(self.chronos_config.quantiles, dtype=self.dtype)
+        self.register_buffer("quantiles", quantiles, persistent=False)
+
+        self.output_patch_embedding = ResidualBlock(
+            in_dim=config.d_model,
+            h_dim=config.d_ff,
+            out_dim=self.num_quantiles * self.chronos_config.prediction_length,
+            act_fn_name=config.dense_act_fn,
+            dropout_p=config.dropout_rate,
+        )
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        """Initialize the weights"""
+        factor = self.config.initializer_factor
+        if isinstance(module, (self.__class__)):
+            module.shared.weight.data.normal_(mean=0.0, std=factor * 1.0)
+        elif isinstance(module, ResidualBlock):
+            module.hidden_layer.weight.data.normal_(
+                mean=0.0,
+                std=factor * ((self.chronos_config.input_patch_size * 2) ** -0.5),
+            )
+            if hasattr(module.hidden_layer, "bias") and module.hidden_layer.bias is not None:
+                module.hidden_layer.bias.data.zero_()
+
+            module.residual_layer.weight.data.normal_(
+                mean=0.0,
+                std=factor * ((self.chronos_config.input_patch_size * 2) ** -0.5),
+            )
+            if hasattr(module.residual_layer, "bias") and module.residual_layer.bias is not None:
+                module.residual_layer.bias.data.zero_()
+
+            module.output_layer.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_ff) ** -0.5))
+            if hasattr(module.output_layer, "bias") and module.output_layer.bias is not None:
+                module.output_layer.bias.data.zero_()
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        target: Optional[torch.Tensor] = None,
+        target_mask: Optional[torch.Tensor] = None,
+    ) -> ChronosBoltOutput:
+        mask = mask.to(context.dtype) if mask is not None else torch.isnan(context).logical_not().to(context.dtype)
+
+        batch_size, _ = context.shape
+        if context.shape[-1] > self.chronos_config.context_length:
+            context = context[..., -self.chronos_config.context_length :]
+            mask = mask[..., -self.chronos_config.context_length :]
+
+        # scaling
+        context, loc_scale = self.instance_norm(context)
+
+        # the scaling op above is done in 32-bit precision,
+        # then the context is moved to model's dtype
+        context = context.to(self.dtype)
+        mask = mask.to(self.dtype)
+
+        # patching
+        patched_context = self.patch(context)
+        patched_mask = torch.nan_to_num(self.patch(mask), nan=0.0)
+        patched_context[~(patched_mask > 0)] = 0.0
+        # concat context and mask along patch dim
+        patched_context = torch.cat([patched_context, patched_mask], dim=-1)
+
+        # attention_mask = 1 if at least one item in the patch is observed
+        attention_mask = patched_mask.sum(dim=-1) > 0  # (batch_size, patched_seq_length)
+
+        input_embeds = self.input_patch_embedding(patched_context)
+
+        if self.chronos_config.use_reg_token:
+            # Append [REG]
+            reg_input_ids = torch.full(
+                (batch_size, 1),
+                self.config.reg_token_id,
+                device=input_embeds.device,
+            )
+            reg_embeds = self.shared(reg_input_ids)
+            input_embeds = torch.cat([input_embeds, reg_embeds], dim=-2)
+            attention_mask = torch.cat([attention_mask, torch.ones_like(reg_input_ids)], dim=-1)
+
+        encoder_outputs = self.encoder(
+            attention_mask=attention_mask,
+            inputs_embeds=input_embeds,
+        )
+        hidden_states = encoder_outputs[0]
+
+        sequence_output = self.decode(input_embeds, attention_mask, hidden_states)
+
+        quantile_preds_shape = (
+            batch_size,
+            self.num_quantiles,
+            self.chronos_config.prediction_length,
+        )
+        quantile_preds = self.output_patch_embedding(sequence_output).view(*quantile_preds_shape)
+
+        loss = None
+        if target is not None:
+            # normalize target
+            target, _ = self.instance_norm(target, loc_scale)
+            target = target.unsqueeze(1)  # type: ignore
+            assert self.chronos_config.prediction_length >= target.shape[-1]
+
+            target = target.to(quantile_preds.device)
+            target_mask = (
+                target_mask.unsqueeze(1).to(quantile_preds.device) if target_mask is not None else ~torch.isnan(target)
+            )
+            target[~target_mask] = 0.0
+
+            # pad target and target_mask if they are shorter than model's prediction_length
+            if self.chronos_config.prediction_length > target.shape[-1]:
+                padding_shape = (*target.shape[:-1], self.chronos_config.prediction_length - target.shape[-1])
+                target = torch.cat([target, torch.zeros(padding_shape).to(target)], dim=-1)
+                target_mask = torch.cat([target_mask, torch.zeros(padding_shape).to(target_mask)], dim=-1)
+
+            loss = (
+                2
+                * torch.abs(
+                    (target - quantile_preds)
+                    * ((target <= quantile_preds).float() - self.quantiles.view(1, self.num_quantiles, 1))
+                )
+                * target_mask.float()
+            )
+            loss = loss.mean(dim=-2)  # Mean over prediction horizon
+            loss = loss.sum(dim=-1)  # Sum over quantile levels
+            loss = loss.mean()  # Mean over batch
+
+        # Unscale predictions
+        quantile_preds = self.instance_norm.inverse(
+            quantile_preds.view(batch_size, -1),
+            loc_scale,
+        ).view(*quantile_preds_shape)
+
+        return ChronosBoltOutput(
+            loss=loss,
+            quantile_preds=quantile_preds,
+        )
+
+    def _init_decoder(self, config):
+        decoder_config = copy.deepcopy(config)
+        decoder_config.is_decoder = True
+        decoder_config.is_encoder_decoder = False
+        decoder_config.num_layers = config.num_decoder_layers
+        self.decoder = T5Stack(decoder_config, self.shared)
+
+    def decode(
+        self,
+        input_embeds,
+        attention_mask,
+        hidden_states,
+        output_attentions=False,
+    ):
+        """
+        Parameters
+        ----------
+        input_embeds: torch.Tensor
+            Patched and embedded inputs. Shape (batch_size, patched_context_length, d_model)
+        attention_mask: torch.Tensor
+            Attention mask for the patched context. Shape (batch_size, patched_context_length), type: torch.int64
+        hidden_states: torch.Tensor
+            Hidden states returned by the encoder. Shape (batch_size, patched_context_length, d_model)
+
+        Returns
+        -------
+        last_hidden_state
+            Last hidden state returned by the decoder, of shape (batch_size, 1, d_model)
+        """
+        batch_size = input_embeds.shape[0]
+        decoder_input_ids = torch.full(
+            (batch_size, 1),
+            self.config.decoder_start_token_id,
+            device=input_embeds.device,
+        )
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            encoder_hidden_states=hidden_states,
+            encoder_attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            return_dict=True,
+        )
+
+        return decoder_outputs.last_hidden_state  # sequence_outputs, b x 1 x d_model
+
+
+class ChronosBoltPipeline(BaseChronosPipeline):
+    forecast_type: ForecastType = ForecastType.QUANTILES
+    default_context_length: int = 2048
+    # register this class name with this alias for backward compatibility
+    _aliases = ["PatchedT5Pipeline"]
+
+    def __init__(self, model: ChronosBoltModelForForecasting):
+        super().__init__(inner_model=model)
+        self.model = model
+
+    @property
+    def quantiles(self) -> List[float]:
+        return self.model.config.chronos_config["quantiles"]
+
+    def predict(  # type: ignore[override]
+        self,
+        context: Union[torch.Tensor, List[torch.Tensor]],
+        prediction_length: Optional[int] = None,
+        limit_prediction_length: bool = False,
+    ):
+        context_tensor = self._prepare_and_validate_context(context=context)
+
+        model_context_length = self.model.config.chronos_config["context_length"]
+        model_prediction_length = self.model.config.chronos_config["prediction_length"]
+        if prediction_length is None:
+            prediction_length = model_prediction_length
+
+        if prediction_length > model_prediction_length:
+            msg = (
+                f"We recommend keeping prediction length <= {model_prediction_length}. "
+                "The quality of longer predictions may degrade since the model is not optimized for it. "
+            )
+            if limit_prediction_length:
+                msg += "You can turn off this check by setting `limit_prediction_length=False`."
+                raise ValueError(msg)
+            warnings.warn(msg)
+
+        predictions = []
+        remaining = prediction_length
+
+        # We truncate the context here because otherwise batches with very long
+        # context could take up large amounts of GPU memory unnecessarily.
+        if context_tensor.shape[-1] > model_context_length:
+            context_tensor = context_tensor[..., -model_context_length:]
+
+        # TODO: We unroll the forecast of Chronos Bolt greedily with the full forecast
+        # horizon that the model was trained with (i.e., 64). This results in variance collapsing
+        # every 64 steps.
+        while remaining > 0:
+            with torch.no_grad():
+                prediction = self.model(
+                    context=context_tensor.to(
+                        device=self.model.device,
+                        dtype=torch.float32,  # scaling should be done in 32-bit precision
+                    ),
+                ).quantile_preds.to(context_tensor)
+
+            predictions.append(prediction)
+            remaining -= prediction.shape[-1]
+
+            if remaining <= 0:
+                break
+
+            central_idx = torch.abs(torch.tensor(self.quantiles) - 0.5).argmin()
+            central_prediction = prediction[:, central_idx]
+
+            context_tensor = torch.cat([context_tensor, central_prediction], dim=-1)
+
+        return torch.cat(predictions, dim=-1)[..., :prediction_length]
+
+    def predict_quantiles(
+        self, context: torch.Tensor, prediction_length: int, quantile_levels: List[float], **kwargs
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # shape (batch_size, prediction_length, len(training_quantile_levels))
+        predictions = (
+            self.predict(
+                context,
+                prediction_length=prediction_length,
+            )
+            .detach()
+            .cpu()
+            .swapaxes(1, 2)
+        )
+
+        training_quantile_levels = self.quantiles
+
+        if set(quantile_levels).issubset(set(training_quantile_levels)):
+            # no need to perform intra/extrapolation
+            quantiles = predictions[..., [training_quantile_levels.index(q) for q in quantile_levels]]
+        else:
+            # we rely on torch for interpolating quantiles if quantiles that
+            # Chronos Bolt was trained on were not provided
+            if min(quantile_levels) < min(training_quantile_levels) or max(quantile_levels) > max(
+                training_quantile_levels
+            ):
+                logger.warning(
+                    f"\tQuantiles to be predicted ({quantile_levels}) are not within the range of "
+                    f"quantiles that Chronos-Bolt was trained on ({training_quantile_levels}). "
+                    "Quantile predictions will be set to the minimum/maximum levels at which Chronos-Bolt "
+                    "was trained on. This may significantly affect the quality of the predictions."
+                )
+
+            # TODO: this is a hack that assumes the model's quantiles during training (training_quantile_levels)
+            # made up an equidistant grid along the quantile dimension. i.e., they were (0.1, 0.2, ..., 0.9).
+            # While this holds for official Chronos-Bolt models, this may not be true in the future, and this
+            # function may have to be revised.
+            augmented_predictions = torch.cat(
+                [predictions[..., [0]], predictions, predictions[..., [-1]]],
+                dim=-1,
+            )
+            quantiles = torch.quantile(
+                augmented_predictions, q=torch.tensor(quantile_levels, dtype=augmented_predictions.dtype), dim=-1
+            ).permute(1, 2, 0)
+        mean = predictions[:, :, training_quantile_levels.index(0.5)]
+        return quantiles, mean
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        """
+        Load the model, either from a local path or from the HuggingFace Hub.
+        Supports the same arguments as ``AutoConfig`` and ``AutoModel``
+        from ``transformers``.
+        """
+        # if optimization_strategy is provided, pop this as it won't be used
+        kwargs.pop("optimization_strategy", None)
+
+        config = AutoConfig.from_pretrained(*args, **kwargs)
+        assert hasattr(config, "chronos_config"), "Not a Chronos config file"
+
+        context_length = kwargs.pop("context_length", None)
+        if context_length is not None:
+            config.chronos_config["context_length"] = context_length
+
+        architecture = config.architectures[0]
+        class_ = globals().get(architecture)
+
+        # TODO: remove this once all models carry the correct architecture names in their configuration
+        # and raise an error instead.
+        if class_ is None:
+            logger.warning(f"Unknown architecture: {architecture}, defaulting to ChronosBoltModelForForecasting")
+            class_ = ChronosBoltModelForForecasting
+
+        model = class_.from_pretrained(*args, **kwargs)
+        return cls(model=model)
+
+def compute_time_series_stats(tensor, dim=-1, keepdim=False):
+    """
+    mean, std, min, max
+    """
+    mean_val = tensor.mean(dim=dim, keepdim=keepdim)
+    std_val = tensor.std(dim=dim, keepdim=keepdim)
+    min_val = tensor.min(dim=dim, keepdim=keepdim)[0]
+    max_val = tensor.max(dim=dim, keepdim=keepdim)[0]
+
+    return torch.cat([mean_val, std_val, min_val, max_val], dim=-1)
+
+
+class ChronosBoltModelForForecastingWithRetrieval(T5PreTrainedModel):
+    _keys_to_ignore_on_load_missing = [
+        r"input_patch_embedding\.",
+        r"output_patch_embedding\.",
+    ]
+    _keys_to_ignore_on_load_unexpected = [r"lm_head.weight"]
+    _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight"]
+
+    def __init__(self, config: T5Config, augment: str):
+        assert hasattr(config, "chronos_config"), "Not a Chronos config file"
+
+        super().__init__(config)
+        self.model_dim = config.d_model
+        self.augment = augment
+
+        # TODO: remove filtering eventually, added for backward compatibility
+        config_fields = {f.name for f in fields(ChronosBoltConfig)}
+        self.chronos_config = ChronosBoltConfig(
+            **{k: v for k, v in config.chronos_config.items() if k in config_fields}
+        )
+
+        # Only decoder_start_id (and optionally REG token)
+        if self.chronos_config.use_reg_token:
+            config.reg_token_id = 1
+
+        config.vocab_size = 2 if self.chronos_config.use_reg_token else 1
+        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+
+        # Input patch embedding layer
+        self.input_patch_embedding = ResidualBlock(
+            in_dim=self.chronos_config.input_patch_size * 2,
+            h_dim=config.d_ff,
+            out_dim=config.d_model,
+            act_fn_name=config.dense_act_fn,
+            dropout_p=config.dropout_rate,
+        )
+
+        # patching layer
+        self.patch = Patch(
+            patch_size=self.chronos_config.input_patch_size,
+            patch_stride=self.chronos_config.input_patch_stride,
+        )
+
+        # instance normalization, also referred to as "scaling" in Chronos and GluonTS
+        self.instance_norm = InstanceNorm()
+
+        encoder_config = copy.deepcopy(config)
+        encoder_config.is_decoder = False
+        encoder_config.use_cache = False
+        encoder_config.is_encoder_decoder = False
+        self.encoder = T5Stack(encoder_config, self.shared)
+
+        self._init_decoder(config)
+
+        self.num_quantiles = len(self.chronos_config.quantiles)
+        quantiles = torch.tensor(self.chronos_config.quantiles, dtype=self.dtype)
+        self.register_buffer("quantiles", quantiles, persistent=False)
+
+        self.output_patch_embedding = ResidualBlock(
+            in_dim=config.d_model,
+            h_dim=config.d_ff,
+            out_dim=self.num_quantiles * self.chronos_config.prediction_length,
+            act_fn_name=config.dense_act_fn,
+            dropout_p=config.dropout_rate,
+        )
+
+        self.dropout = nn.Dropout(p=0.2)
+
+        # Retrieval Augmentation Layer
+
+        if 'gate' in self.augment:
+            # gate: MLP + Linear
+            self.gate_layer = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length * 2 + 512 + 12, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.gate_linear1 = nn.Linear(self.chronos_config.prediction_length * 2 + 512 + 12, config.d_model)
+            self.gate_linear2 = nn.Linear(config.d_model, 1)
+
+        if 'moe' in self.augment:
+            # moe: moe with topk+1 experts, use mha
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.mha = nn.MultiheadAttention(embed_dim=config.d_model, num_heads=8, batch_first=True)
+            self.ffn = nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.gate_layer = nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, 1),
+            )
+
+        if self.augment == 'moe_disentangle':
+            self.disentangle_gate = nn.Linear(config.d_model * 2, config.d_model, bias=False)
+            self.final_pred_head = nn.Linear(self.chronos_config.prediction_length * 2, self.chronos_config.prediction_length)
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.inv_aux_backproj = nn.Linear(pred_dim, config.d_model)
+            self.dyn_aux_backproj = nn.Linear(pred_dim, config.d_model)
+
+        if self.augment == 'idf':
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.routing_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.inv_transition = nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.dyn_transition = nn.Sequential(
+                nn.Linear(config.d_model * 2, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.inv_head = nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.dyn_head = nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.final_head = nn.Sequential(
+                nn.Linear(config.d_model * 2, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+
+        if self.augment in ['idf_branch', 'idf_x']:
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.routing_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.inv_pred_head = nn.Linear(config.d_model, pred_dim)
+            self.inv_residual_head = nn.Linear(config.d_model, pred_dim)
+            self.dyn_pred_head = nn.Linear(config.d_model * 2, pred_dim)
+            self.final_pred_head = nn.Linear(pred_dim * 2, pred_dim)
+            self.inv_aux_backproj = nn.Linear(pred_dim, config.d_model)
+            self.dyn_aux_backproj = nn.Linear(pred_dim, config.d_model)
+
+        if self.augment in ['idf_clean_dis', 'idf_clean_dis_v3', 'idf_clean_dis_v4']:
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.routing_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.inv_pred_head = nn.Linear(config.d_model, pred_dim)
+            self.dyn_pred_head_clean = nn.Linear(config.d_model, pred_dim)
+            self.final_pred_head = nn.Linear(pred_dim * 2, pred_dim)
+            self.inv_aux_backproj = nn.Linear(pred_dim, config.d_model)
+            self.dyn_aux_backproj = nn.Linear(pred_dim, config.d_model)
+
+        if self.augment == 'idf_ridde_v2':
+            # RIDDE "Training Objective ver 2.0" (paper Eq. 15-23): same retrieval /
+            # gating / decomposition architecture as idf_clean_dis, but trained with
+            # L_sem + L_xcov + L_ord instead of the ver1.0 orthogonality loss L_dis.
+            # No inv_aux_backproj/dyn_aux_backproj: those only feed the ver1.0-style
+            # auxiliary losses (loss_inv/loss_ret/loss_dyn), which ver2.0 does not use.
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.routing_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.inv_pred_head = nn.Linear(config.d_model, pred_dim)
+            self.dyn_pred_head_clean = nn.Linear(config.d_model, pred_dim)
+            self.final_pred_head = nn.Linear(pred_dim * 2, pred_dim)
+
+        if self.augment == 'idf_clean_dis_deepmlp':
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                # nn.Dropout(self.dropout.p),
+                nn.Linear(config.d_model, config.d_model),
+                nn.ReLU(),
+                # nn.Dropout(self.dropout.p),
+                nn.Linear(config.d_model, config.d_model),
+                nn.ReLU(),
+                # nn.Dropout(self.dropout.p),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.routing_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.inv_pred_head = nn.Linear(config.d_model, pred_dim)
+            self.dyn_pred_head_clean = nn.Linear(config.d_model, pred_dim)
+            self.final_pred_head = nn.Linear(pred_dim * 2, pred_dim)
+            self.inv_aux_backproj = nn.Linear(pred_dim, config.d_model)
+            self.dyn_aux_backproj = nn.Linear(pred_dim, config.d_model)
+
+        if self.augment == 'idf_clean_dis_ts3align':
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            # Keep the module available for compatibility, but the default TS3-aligned
+            # branch uses uniform aggregation instead of learned query-conditioned scoring.
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.routing_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.inv_pred_head = nn.Linear(config.d_model, pred_dim)
+            self.dyn_pred_head_clean = nn.Linear(config.d_model, pred_dim)
+            self.final_pred_head = nn.Linear(pred_dim * 2, pred_dim)
+            self.inv_aux_backproj = nn.Linear(pred_dim, config.d_model)
+            self.dyn_aux_backproj = nn.Linear(pred_dim, config.d_model)
+
+        if self.augment == 'idf_trr_dualpath':
+            # RIDDE_新版目标函数与最终实验方案 Stage 3 (Dual+ERM，对应文档第3节结构 +
+            # 第7.3节 2x2 表格的 "Dual path x ERM" 格子)。先只搭双路径结构本身
+            # (两个独立投影器 P_inv/P_dyn + 加法重构) 和 L_sep（xcov+方差下限），
+            # 不接 L_TRR/CVaR —— 那是下一步(Stage 4)才加，等这一步先确认双路径
+            # 结构本身能训得动、两条路径不会有一条直接塌缩。
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            # Stage 4 前的清理：诊断分支里试过给 e_q/h_r 加 LayerNorm(v1)/BatchNorm1d(v2)
+            # 做尺度对齐，结果三个版本(无归一化/LayerNorm/BatchNorm1d)的 z_inv 塌缩比例
+            # 是 90.76%/87.76%/93.75%，跟尺度对齐程度(0.65%/12.66%/110%)完全不单调，
+            # BatchNorm1d 对齐最好但塌缩最严重——证明尺度不匹配不是塌缩的根因，遂放弃
+            # 这个方向(留档见项目里的诊断记录)。Stage 4 接 CVaR 时退回方案文档3.1节的
+            # 原始结构，不带任何归一化层，避免把未验证的改动和 CVaR 的效果混在一起。
+            # P_inv([e_q; h_r; e_q*h_r; |e_q-h_r|]) -> 输入维度 4*d_model
+            self.P_inv = nn.Sequential(
+                nn.Linear(config.d_model * 4, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            # P_dyn([e_q; e_q-h_r]) -> 输入维度 2*d_model
+            self.P_dyn = nn.Sequential(
+                nn.Linear(config.d_model * 2, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.f_inv = nn.Linear(config.d_model, pred_dim)
+            self.f_dyn = nn.Linear(config.d_model, pred_dim)
+
+        if self.augment == 'idf_trr_dualpath_learnfuse':
+            # 结构定义完全复用 idf_trr_dualpath(h_r聚合方式、z_inv_in/z_dyn_in拼接、
+            # P_inv/P_dyn)，唯一新增 final_pred_head，用来把"加法重构"换成
+            # idf_clean_dis(老RIDDE)那种可学习线性融合头，做单变量消融对比。
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.P_inv = nn.Sequential(
+                nn.Linear(config.d_model * 4, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.P_dyn = nn.Sequential(
+                nn.Linear(config.d_model * 2, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.f_inv = nn.Linear(config.d_model, pred_dim)
+            self.f_dyn = nn.Linear(config.d_model, pred_dim)
+            self.final_pred_head = nn.Linear(pred_dim * 2, pred_dim)
+
+        if self.augment == 'idf_h_linear_head':
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.h_pred_head = nn.Linear(config.d_model, pred_dim)
+
+        if self.augment == 'idf_h_native_head':
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+
+        if self.augment == 'idf_y_linear_head':
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.h_pred_head = nn.Linear(config.d_model, pred_dim)
+            self.y_linear_head = nn.Linear(pred_dim, pred_dim)
+
+        if self.augment == 'idf_branch_gru':
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.routing_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.inv_pred_head = nn.Linear(config.d_model, pred_dim)
+            self.inv_residual_head = nn.Linear(config.d_model, pred_dim)
+            self.dyn_gru = nn.GRU(
+                input_size=config.d_model * 2,
+                hidden_size=config.d_model,
+                batch_first=True,
+            )
+            self.dyn_out_head = nn.Linear(config.d_model, self.num_quantiles)
+            self.final_pred_head = nn.Linear(pred_dim * 2, pred_dim)
+
+        if self.augment == 'idf_branch_gru_q':
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.routing_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.inv_pred_head = nn.Linear(config.d_model, pred_dim)
+            self.inv_residual_head = nn.Linear(config.d_model, pred_dim)
+            self.dyn_gru = nn.GRU(
+                input_size=config.d_model * 2 + self.num_quantiles,
+                hidden_size=config.d_model,
+                batch_first=True,
+            )
+            self.dyn_out_head = nn.Linear(config.d_model, self.num_quantiles)
+            self.final_pred_head = nn.Linear(pred_dim * 2, pred_dim)
+
+        if self.augment == 'idf_dual_direct_head':
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.routing_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.inv_hidden_proj = nn.Linear(config.d_model, config.d_model)
+            self.dyn_ret_hidden_proj = nn.Linear(config.d_model * 2, config.d_model)
+            self.final_pred_head = nn.Linear(pred_dim * 2, pred_dim)
+
+        if self.augment == 'idf_residual':
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.encode_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.prediction_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.ret_score_head = nn.Linear(config.d_model * 2, 1)
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.routing_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.inv_pred_head = nn.Linear(config.d_model, pred_dim)
+            self.dyn_pred_head = nn.Linear(config.d_model * 2, pred_dim)
+
+        if self.augment == 'idf_dual_projector':
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.g_inv = nn.Linear(config.d_model * 2, config.d_model)
+            self.g_dyn = nn.Linear(config.d_model * 2, config.d_model)
+            self.f_inv = nn.Linear(config.d_model, pred_dim)
+            self.f_dyn = nn.Linear(config.d_model, pred_dim)
+
+        if self.augment == 'idf_dual_projector_mlp':
+            pred_dim = self.num_quantiles * self.chronos_config.prediction_length
+            self.retrieved_x_encoder_mlp = nn.Sequential(
+                nn.Linear(self.chronos_config.context_length, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.fuse_gate = nn.Linear(config.d_model * 2, config.d_model)
+            self.g_inv = nn.Linear(config.d_model * 2, config.d_model)
+            self.g_dyn = nn.Linear(config.d_model * 2, config.d_model)
+            self.f_inv = nn.Linear(config.d_model, pred_dim)
+            self.f_dyn = nn.Linear(config.d_model, pred_dim)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        """Initialize the weights"""
+        factor = self.config.initializer_factor
+        if isinstance(module, (self.__class__)):
+            module.shared.weight.data.normal_(mean=0.0, std=factor * 1.0)
+        elif isinstance(module, ResidualBlock):
+            module.hidden_layer.weight.data.normal_(
+                mean=0.0,
+                std=factor * ((self.chronos_config.input_patch_size * 2) ** -0.5),
+            )
+            if hasattr(module.hidden_layer, "bias") and module.hidden_layer.bias is not None:
+                module.hidden_layer.bias.data.zero_()
+
+            module.residual_layer.weight.data.normal_(
+                mean=0.0,
+                std=factor * ((self.chronos_config.input_patch_size * 2) ** -0.5),
+            )
+            if hasattr(module.residual_layer, "bias") and module.residual_layer.bias is not None:
+                module.residual_layer.bias.data.zero_()
+
+            module.output_layer.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_ff) ** -0.5))
+            if hasattr(module.output_layer, "bias") and module.output_layer.bias is not None:
+                module.output_layer.bias.data.zero_()
+    
+    def init_extra_weights(self, layers):
+        """
+        Initialize weights for multiple layers.
+        
+        Args:
+            layers (list): List of layers (e.g., [self.retrieve_yin_layer, ...]).
+        """
+        factor = self.config.initializer_factor
+        
+        for layer in layers:
+            if isinstance(layer, nn.Sequential):
+                self.init_extra_weights(layer)
+            if isinstance(layer, nn.Linear):
+                # Initialize weights using normal distribution
+                layer.weight.data.normal_(mean=0.0, std=factor * ((self.chronos_config.input_patch_size * 2) ** -0.5))
+                
+                # Initialize biases to zero if they exist
+                if layer.bias is not None:
+                    layer.bias.data.zero_()
+            if isinstance(layer, nn.MultiheadAttention):
+                # Initialize weights using normal distribution
+                nn.init.xavier_uniform_(layer.in_proj_weight)
+                nn.init.xavier_uniform_(layer.out_proj.weight)
+                
+                # Initialize biases to zero if they exist
+                if layer.in_proj_bias is not None:
+                    layer.in_proj_bias.data.zero_()
+                if layer.out_proj.bias is not None:
+                    layer.out_proj.bias.data.zero_()
+            if isinstance(layer, nn.GRU):
+                for name, param in layer.named_parameters():
+                    if "weight_ih" in name:
+                        nn.init.xavier_uniform_(param.data)
+                    elif "weight_hh" in name:
+                        nn.init.orthogonal_(param.data)
+                    elif "bias" in name:
+                        param.data.zero_()
+
+    def _run_moe_fusion(
+        self,
+        sequence_output: torch.Tensor,
+        retrieved_y: torch.Tensor,
+        r_M: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        retrieved_y_enc = []
+        for i in range(r_M):
+            retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+        retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+        all_enc = torch.cat([sequence_output, retrieved_y_enc], dim=1)
+        att_output, _ = self.mha(all_enc, all_enc, all_enc)
+        att_output = all_enc + att_output
+        att_output = att_output + self.dropout(self.ffn(att_output))
+
+        scores = []
+        for i in range(r_M + 1):
+            gate = torch.sigmoid(self.gate_layer(att_output[:, i, :]))
+            scores.append(gate)
+        scores = torch.stack(scores, dim=1)
+        alpha = F.softmax(scores, dim=1)
+        fused_sequance_output = torch.sum(alpha * att_output, dim=1)
+        fused_sequance_output = self.dropout(fused_sequance_output)
+        sequence_output = sequence_output + fused_sequance_output.unsqueeze(1)
+        return sequence_output, retrieved_y_enc, alpha
+
+    def _project_with_native_head(
+        self,
+        hidden_state: torch.Tensor,
+        quantile_preds_shape: tuple[int, int, int],
+    ) -> torch.Tensor:
+        native_head_output = self.output_patch_embedding(hidden_state.unsqueeze(1))
+        assert native_head_output.shape[-1] == self.num_quantiles * self.chronos_config.prediction_length, "output_patch_embedding output dim mismatch"
+        return native_head_output.view(*quantile_preds_shape)
+
+    def _debug_print_disentangle_shapes(self, **tensor_map: torch.Tensor) -> None:
+        if not getattr(self, "debug_shapes", False) or getattr(self, "_debug_shapes_printed", False):
+            return
+        print("moe_disentangle debug shapes:")
+        for name, tensor in tensor_map.items():
+            print(f"  {name}: {tuple(tensor.shape)}")
+        self._debug_shapes_printed = True
+
+    @staticmethod
+    def _zero_loss_like(reference_tensor: torch.Tensor) -> torch.Tensor:
+        return reference_tensor.new_zeros(())
+
+    def _encode_context_hidden(
+        self,
+        context: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if mask is None:
+            mask = torch.isnan(context).logical_not().to(context.dtype)
+        else:
+            mask = mask.to(context.dtype)
+
+        if context.shape[-1] > self.chronos_config.context_length:
+            context = context[..., -self.chronos_config.context_length :]
+            mask = mask[..., -self.chronos_config.context_length :]
+
+        context, _ = self.instance_norm(context)
+        context = context.to(self.dtype)
+        mask = mask.to(self.dtype)
+
+        patched_context = self.patch(context)
+        patched_mask = torch.nan_to_num(self.patch(mask), nan=0.0)
+        patched_context[~(patched_mask > 0)] = 0.0
+        patched_context = torch.cat([patched_context, patched_mask], dim=-1)
+        attention_mask = patched_mask.sum(dim=-1) > 0
+
+        input_embeds = self.input_patch_embedding(patched_context)
+
+        if self.chronos_config.use_reg_token:
+            batch_size = input_embeds.shape[0]
+            reg_input_ids = torch.full(
+                (batch_size, 1),
+                self.config.reg_token_id,
+                device=input_embeds.device,
+            )
+            reg_embeds = self.shared(reg_input_ids)
+            input_embeds = torch.cat([input_embeds, reg_embeds], dim=-2)
+            attention_mask = torch.cat([attention_mask, torch.ones_like(reg_input_ids)], dim=-1)
+
+        encoder_outputs = self.encoder(
+            attention_mask=attention_mask,
+            inputs_embeds=input_embeds,
+        )
+        hidden_states = encoder_outputs[0]
+        sequence_output = self.decode(input_embeds, attention_mask, hidden_states)
+        return sequence_output.squeeze(1)
+
+    def _debug_print_dual_projector_shapes(self, **tensor_map: torch.Tensor) -> None:
+        if not getattr(self, "debug_shapes", False) or getattr(self, "_debug_shapes_printed", False):
+            return
+        print(f"{self.augment} debug shapes:")
+        for name, tensor in tensor_map.items():
+            print(f"  {name}: {tuple(tensor.shape)}")
+        self._debug_shapes_printed = True
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        target: Optional[torch.Tensor] = None,
+        target_mask: Optional[torch.Tensor] = None,
+        retrieved_seq: Optional[torch.Tensor] = None,
+        distances: Optional[torch.Tensor] = None,
+    ) -> ChronosBoltOutput:
+        mask = mask.to(context.dtype) if mask is not None else torch.isnan(context).logical_not().to(context.dtype)
+        
+        batch_size, _ = context.shape
+        if context.shape[-1] > self.chronos_config.context_length:
+            context = context[..., -self.chronos_config.context_length :]
+            mask = mask[..., -self.chronos_config.context_length :]
+
+        # scaling
+        context, loc_scale = self.instance_norm(context)
+        context = context.to(self.dtype)
+        mask = mask.to(self.dtype)
+
+        # patching
+        patched_context = self.patch(context)
+        patched_mask = torch.nan_to_num(self.patch(mask), nan=0.0)
+        patched_context[~(patched_mask > 0)] = 0.0
+        # concat context and mask along patch dim
+        patched_context = torch.cat([patched_context, patched_mask], dim=-1)
+
+        # attention_mask = 1 if at least one item in the patch is observed
+        attention_mask = patched_mask.sum(dim=-1) > 0  # (batch_size, patched_seq_length)
+
+        input_embeds = self.input_patch_embedding(patched_context)
+        # import pdb; pdb.set_trace()
+
+        if self.chronos_config.use_reg_token:
+            # Append [REG]
+            reg_input_ids = torch.full(
+                (batch_size, 1),
+                self.config.reg_token_id,
+                device=input_embeds.device,
+            )
+            reg_embeds = self.shared(reg_input_ids)
+            input_embeds = torch.cat([input_embeds, reg_embeds], dim=-2)
+            attention_mask = torch.cat([attention_mask, torch.ones_like(reg_input_ids)], dim=-1)
+
+        encoder_outputs = self.encoder(
+            attention_mask=attention_mask,
+            inputs_embeds=input_embeds,
+        )
+        hidden_states = encoder_outputs[0]
+
+        sequence_output = self.decode(input_embeds, attention_mask, hidden_states)
+
+        quantile_preds_shape = (
+            batch_size,
+            self.num_quantiles,
+            self.chronos_config.prediction_length,
+        )
+        aux_h_ret = None
+        aux_z_inv = None
+        aux_z_dyn = None
+        aux_y_inv = None
+        aux_y_dyn = None
+        aux_gamma_v3 = None
+        dual_projector_metrics = None
+        ridde_v2_metrics = None
+        v4_metrics = None
+        # RIDDE_新版目标函数与最终实验方案 Stage 3 (Dual+ERM)：z_inv/z_dyn 单独存一份，
+        # 不复用 aux_z_inv/aux_z_dyn（那两个是给 ver1.0 disentangle 家族的
+        # use_disentangle_aux_loss 分支用的，公式和这里完全不同，混用会互相干扰）。
+        aux_z_inv_trr = None
+        aux_z_dyn_trr = None
+        aux_e_q_rob = None
+        aux_retrieved_y_enc_rob = None
+        aux_omega_rob = None
+        aux_target_rob = None
+
+        if self.augment == 'baseline':
+            fused_quantile_preds = self.output_patch_embedding(sequence_output).view(*quantile_preds_shape)
+        else:
+            retrieved_seq, loc_scale_retrieved = self.instance_norm(retrieved_seq)
+
+            # fuse retrieved sequence
+            if 'moe' not in self.augment and self.augment != 'idf_branch' and self.augment != 'idf_x' and self.augment != 'idf_clean_dis' and self.augment != 'idf_clean_dis_v3' and self.augment != 'idf_clean_dis_v4' and self.augment != 'idf_clean_dis_deepmlp' and self.augment != 'idf_clean_dis_ts3align' and self.augment != 'idf_ridde_v2' and self.augment != 'idf_h_linear_head' and self.augment != 'idf_h_native_head' and self.augment != 'idf_y_linear_head' and self.augment != 'idf_residual' and self.augment != 'idf_branch_gru' and self.augment != 'idf_branch_gru_q' and self.augment != 'idf_dual_direct_head' and self.augment != 'idf_dual_projector' and self.augment != 'idf_dual_projector_mlp' and self.augment != 'idf_trr_dualpath' and self.augment != 'idf_trr_dualpath_learnfuse':
+                weights = torch.softmax(-distances, dim=1)
+                retrieved_seq = (weights.unsqueeze(-1) * retrieved_seq).sum(dim=1)
+                retrieved_seq = retrieved_seq.unsqueeze(1)
+            # B, L = target.shape
+            L = self.chronos_config.prediction_length if self.augment in ['idf_branch', 'idf_x', 'idf_clean_dis', 'idf_clean_dis_v3', 'idf_clean_dis_v4', 'idf_clean_dis_deepmlp', 'idf_clean_dis_ts3align', 'idf_ridde_v2', 'idf_h_linear_head', 'idf_h_native_head', 'idf_y_linear_head', 'idf_residual', 'idf_branch_gru', 'idf_branch_gru_q', 'idf_dual_direct_head', 'idf_dual_projector', 'idf_dual_projector_mlp', 'idf_trr_dualpath', 'idf_trr_dualpath_learnfuse'] else 64
+            r_B, r_M, r_L = retrieved_seq.shape
+            assert r_L % 2 == 0, "L of retrieved_seq should be even"
+            retrieved_x, retrieved_y = retrieved_seq.split((r_L-L, L), dim=2)
+            retrieved_seq = retrieved_seq.to(self.dtype)
+
+            if self.augment == 'moe':
+                sequence_output, _, _ = self._run_moe_fusion(sequence_output, retrieved_y, r_M)
+
+            if self.augment == 'moe_disentangle':
+                h_q = sequence_output.squeeze(1)
+                sequence_output, retrieved_y_enc, _ = self._run_moe_fusion(sequence_output, retrieved_y, r_M)
+                e_final = sequence_output.squeeze(1)
+                h_r = retrieved_y_enc
+
+                sim = torch.sum(h_q.unsqueeze(1) * h_r, dim=-1)
+                omega = F.softmax(sim, dim=1)
+                h_ret = torch.sum(omega.unsqueeze(-1) * h_r, dim=1)
+                assert h_ret.shape[-1] == e_final.shape[-1], "h_ret and e_final dimension mismatch"
+
+                gate_in = torch.cat([e_final, h_ret], dim=-1)
+                gamma = torch.sigmoid(self.disentangle_gate(gate_in))
+                z_inv = gamma * e_final
+                z_dyn = (1 - gamma) * e_final
+
+                y_inv = self._project_with_native_head(z_inv, quantile_preds_shape)
+                y_dyn = self._project_with_native_head(z_dyn, quantile_preds_shape)
+                concat_y = torch.cat([y_inv, y_dyn], dim=-1)
+                y_hat = self.final_pred_head(concat_y)
+                fused_quantile_preds = y_hat
+                aux_h_ret = h_ret
+                aux_z_inv = z_inv
+                aux_z_dyn = z_dyn
+                aux_y_inv = y_inv
+                aux_y_dyn = y_dyn
+
+                self._debug_print_disentangle_shapes(
+                    h_q=h_q,
+                    h_r=h_r,
+                    e_final=e_final,
+                    h_ret=h_ret,
+                    gamma=gamma,
+                    z_inv=z_inv,
+                    z_dyn=z_dyn,
+                    y_inv=y_inv,
+                    y_dyn=y_dyn,
+                    y_hat=y_hat,
+                )
+
+            if self.augment == 'idf':
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                q = sequence_output.squeeze(1)
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                ret_score = self.ret_score_head(ret_score_in)
+                alpha = F.softmax(ret_score, dim=1)
+                weighted_R = alpha * retrieved_y_enc
+                h_ret = weighted_R.sum(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                route_in = torch.cat([h, h_ret], dim=-1)
+                gamma = torch.sigmoid(self.routing_gate(route_in))
+                z_inv = gamma * h
+                z_dyn = (1 - gamma) * h
+
+                z_inv_next = self.inv_transition(z_inv)
+                dyn_in = torch.cat([z_dyn, h_ret], dim=-1)
+                z_dyn_next = self.dyn_transition(dyn_in)
+
+                h_inv = self.inv_head(z_inv_next)
+                h_dyn = self.dyn_head(z_dyn_next)
+
+                final_in = torch.cat([h_inv, h_dyn], dim=-1)
+                idf_delta = self.final_head(final_in)
+                sequence_output = sequence_output + self.dropout(idf_delta).unsqueeze(1)
+
+            quantile_preds = self.output_patch_embedding(sequence_output).view(*quantile_preds_shape)
+            if self.augment != 'moe_disentangle':
+                fused_quantile_preds = quantile_preds
+
+            if self.augment in ['idf_branch', 'idf_x']:
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                q = sequence_output.squeeze(1)
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                alpha = F.softmax(self.ret_score_head(ret_score_in), dim=1)
+                h_ret = (alpha * retrieved_y_enc).sum(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                route_in = torch.cat([h, h_ret], dim=-1)
+                gamma = torch.sigmoid(self.routing_gate(route_in))
+                z_inv = gamma * h
+                z_dyn = (1 - gamma) * h
+
+                y_inv_base = self.inv_pred_head(z_inv)
+                y_inv_res = self.inv_residual_head(z_inv)
+                y_inv = (y_inv_base + y_inv_res).view(*quantile_preds_shape)
+
+                dyn_in = torch.cat([z_dyn, h_ret], dim=-1)
+                y_dyn = self.dyn_pred_head(dyn_in).view(*quantile_preds_shape)
+
+                final_in = torch.cat([y_inv.reshape(batch_size, -1), y_dyn.reshape(batch_size, -1)], dim=-1)
+                fused_quantile_preds = self.final_pred_head(final_in).view(*quantile_preds_shape)
+                aux_h_ret = h_ret
+                aux_z_inv = z_inv
+                aux_z_dyn = z_dyn
+                aux_y_inv = y_inv
+                aux_y_dyn = y_dyn
+
+            if self.augment in ['idf_clean_dis', 'idf_clean_dis_deepmlp', 'idf_clean_dis_v3', 'idf_clean_dis_v4']:
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                q = sequence_output.squeeze(1)
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                alpha = F.softmax(self.ret_score_head(ret_score_in), dim=1)
+                h_ret = (alpha * retrieved_y_enc).sum(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                route_in = torch.cat([h, h_ret], dim=-1)
+                gamma = torch.sigmoid(self.routing_gate(route_in))
+                z_inv = gamma * h
+                z_dyn = (1 - gamma) * h
+
+                head_mode = getattr(self, "head_mode", "learned")
+                if head_mode == "frozen_native":
+                    y_inv = self._project_with_native_head(z_inv, quantile_preds_shape)
+                    y_dyn = self._project_with_native_head(z_dyn, quantile_preds_shape)
+                else:
+                    y_inv = self.inv_pred_head(z_inv).view(*quantile_preds_shape)
+                    y_dyn = self.dyn_pred_head_clean(z_dyn).view(*quantile_preds_shape)
+
+                fusion_mode = getattr(self, "fusion_mode", "learned")
+                # 原逻辑：fusion_mode=='additive'仅对idf_clean_dis_v4生效，v3始终走final_pred_head。
+                # 新增：head_mode=='frozen_native'时（v3或v4）强制走加法融合——此时y_inv/y_dyn
+                # 已经是冻结头输出的分位数预测(B,Q,L)，语义上不适合再喂给final_pred_head去
+                # "学习融合"。head_mode=='frozen_native'与fusion_mode!='additive'的非法组合
+                # 由CLI层拦截（pretrain.py/zeroshot.py），这里默认二者已一致。
+                if fusion_mode == "additive" and (self.augment == "idf_clean_dis_v4" or head_mode == "frozen_native"):
+                    fused_quantile_preds = y_inv + y_dyn
+                else:
+                    final_in = torch.cat([y_inv.reshape(batch_size, -1), y_dyn.reshape(batch_size, -1)], dim=-1)
+                    fused_quantile_preds = self.final_pred_head(final_in).view(*quantile_preds_shape)
+                aux_h_ret = h_ret
+                aux_z_inv = z_inv
+                aux_z_dyn = z_dyn
+                aux_y_inv = y_inv
+                aux_y_dyn = y_dyn
+                aux_gamma_v3 = gamma
+
+                if self.augment == 'idf_clean_dis_v4':
+                    raw_retrieved_y = self.instance_norm.inverse(retrieved_y, loc_scale_retrieved)
+                    loc_q, scale_q = loc_scale
+                    # scale_q可以小到~1e-7量级(InstanceNorm对"几乎不变但不逐位相等"的序列
+                    # 没有下限保护，只有精确常数才会被置为1)，此处除法对这类样本会把
+                    # retrieved_y_qframe/y_bar_r放大到失真量级，进而把loss_sem(平方项)
+                    # 打到千万级。1e-2下限比实测正常scale_q均值(~1.5-1.9)低2-3个数量级，
+                    # 基本不影响正常样本，但比实测最小值(~4.6e-7)高4-5个数量级，足以把
+                    # 病态样本的比值压回可控范围。
+                    retrieved_y_qframe = (raw_retrieved_y - loc_q.unsqueeze(1)) / scale_q.clamp_min(1e-2).unsqueeze(1)
+                    y_bar_r = (alpha * retrieved_y_qframe).sum(dim=1)
+                    v4_metrics = {
+                        "y_inv": y_inv,
+                        "y_dyn": y_dyn,
+                        "alpha": alpha,
+                        "retrieved_y_qframe": retrieved_y_qframe,
+                        "y_bar_r": y_bar_r,
+                    }
+                else:
+                    v4_metrics = None
+
+            if self.augment == 'idf_ridde_v2':
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                q = sequence_output.squeeze(1)
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                alpha = F.softmax(self.ret_score_head(ret_score_in), dim=1)
+                h_ret = (alpha * retrieved_y_enc).sum(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                route_in = torch.cat([h, h_ret], dim=-1)
+                gamma = torch.sigmoid(self.routing_gate(route_in))
+                z_inv = gamma * h
+                z_dyn = (1 - gamma) * h
+
+                y_inv = self.inv_pred_head(z_inv).view(*quantile_preds_shape)
+                y_dyn = self.dyn_pred_head_clean(z_dyn).view(*quantile_preds_shape)
+
+                final_in = torch.cat([y_inv.reshape(batch_size, -1), y_dyn.reshape(batch_size, -1)], dim=-1)
+                fused_quantile_preds = self.final_pred_head(final_in).view(*quantile_preds_shape)
+
+                # Eq.17: aggregate retrieved future horizons using the SAME attention
+                # weights `alpha` as h_ret. retrieved_y was normalized with its own
+                # per-sample loc_scale_retrieved (line ~1165 above), a different scale
+                # than target/y_inv/y_dyn (normalized with the query's loc_scale) --
+                # L_sem/L_ord/c_i all compare these directly, so first re-express each
+                # retrieved y_r_k on the query's normalization scale.
+                raw_retrieved_y = self.instance_norm.inverse(retrieved_y, loc_scale_retrieved)
+                loc_q, scale_q = loc_scale
+                retrieved_y_qframe = (raw_retrieved_y - loc_q.unsqueeze(1)) / scale_q.unsqueeze(1)
+                y_bar_r = (alpha * retrieved_y_qframe).sum(dim=1)  # (batch, L)
+
+                ridde_v2_metrics = {
+                    "gamma": gamma,
+                    "z_inv": z_inv,
+                    "z_dyn": z_dyn,
+                    "y_inv": y_inv,
+                    "y_dyn": y_dyn,
+                    "alpha": alpha,
+                    "retrieved_y_qframe": retrieved_y_qframe,
+                    "y_bar_r": y_bar_r,
+                }
+
+            if self.augment == 'idf_clean_dis_ts3align':
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                q = sequence_output.squeeze(1)
+                h_ret = retrieved_y_enc.mean(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                route_in = torch.cat([h, h_ret], dim=-1)
+                gamma = torch.sigmoid(self.routing_gate(route_in))
+                z_inv = gamma * h
+                z_dyn = (1 - gamma) * h
+
+                y_inv = self.inv_pred_head(z_inv).view(*quantile_preds_shape)
+                y_dyn = self.dyn_pred_head_clean(z_dyn).view(*quantile_preds_shape)
+
+                final_in = torch.cat([y_inv.reshape(batch_size, -1), y_dyn.reshape(batch_size, -1)], dim=-1)
+                fused_quantile_preds = self.final_pred_head(final_in).view(*quantile_preds_shape)
+                aux_h_ret = h_ret
+                aux_z_inv = z_inv
+                aux_z_dyn = z_dyn
+                aux_y_inv = y_inv
+                aux_y_dyn = y_dyn
+
+            if self.augment == 'idf_h_linear_head':
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                q = sequence_output.squeeze(1)
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                alpha = F.softmax(self.ret_score_head(ret_score_in), dim=1)
+                h_ret = (alpha * retrieved_y_enc).sum(dim=1)
+
+                # ---- oracle泄露探针：诊断用，不是真实推理路径 ----
+                if getattr(self, "oracle_future_leak", False):
+                    target_own_norm, _ = self.instance_norm(target)  # 用target自己的统计量，
+                                                                        # 跟retrieved_seq同款处理口径
+                    with torch.no_grad():
+                        print(f"[ORACLE_FUTURE_LEAK] target.shape={tuple(target.shape)} "
+                              f"target_own_norm.mean={target_own_norm.mean().item():.6f} "
+                              f"target_own_norm.std={target_own_norm.std().item():.6f}")
+                    h_ret = self.encode_mlp(target_own_norm)           # 直接顶替掉真实检索算出的h_ret
+                # ---- 探针结束，以下逻辑完全不变 ----
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                fused_quantile_preds = self.h_pred_head(h).view(*quantile_preds_shape)
+
+            if self.augment == 'idf_h_native_head':
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                q = sequence_output.squeeze(1)
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                alpha = F.softmax(self.ret_score_head(ret_score_in), dim=1)
+                h_ret = (alpha * retrieved_y_enc).sum(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                # Keep the native Chronos output head frozen by default and verify the
+                # fused hidden state matches its expected [B, 1, d_model] input shape.
+                assert h.shape == (batch_size, self.config.d_model), "idf_h_native_head expects h to have shape [B, d_model]"
+                h_native = h.unsqueeze(1)
+                assert h_native.shape == (batch_size, 1, self.config.d_model), "idf_h_native_head expects h.unsqueeze(1) to have shape [B, 1, d_model]"
+                native_head_output = self.output_patch_embedding(h_native)
+                assert native_head_output.shape[-1] == self.num_quantiles * self.chronos_config.prediction_length, "output_patch_embedding output dim mismatch"
+                fused_quantile_preds = native_head_output.view(*quantile_preds_shape)
+
+            if self.augment == 'idf_y_linear_head':
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                q = sequence_output.squeeze(1)
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                alpha = F.softmax(self.ret_score_head(ret_score_in), dim=1)
+                h_ret = (alpha * retrieved_y_enc).sum(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                y0 = self.h_pred_head(h)
+                y_hat = self.y_linear_head(y0)
+
+                fused_quantile_preds = y_hat.view(*quantile_preds_shape)
+
+            if self.augment == 'idf_branch_gru':
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                q = sequence_output.squeeze(1)
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                alpha = F.softmax(self.ret_score_head(ret_score_in), dim=1)
+                h_ret = (alpha * retrieved_y_enc).sum(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                route_in = torch.cat([h, h_ret], dim=-1)
+                gamma = torch.sigmoid(self.routing_gate(route_in))
+                z_inv = gamma * h
+                z_dyn = (1 - gamma) * h
+
+                y_inv_base = self.inv_pred_head(z_inv)
+                y_inv_res = self.inv_residual_head(z_inv)
+                y_inv = (y_inv_base + y_inv_res).view(*quantile_preds_shape)
+
+                dyn_in = torch.cat([z_dyn, h_ret], dim=-1)
+                dyn_seq = dyn_in.unsqueeze(1).repeat(1, self.chronos_config.prediction_length, 1)
+                gru_out, _ = self.dyn_gru(dyn_seq)
+                y_dyn = self.dyn_out_head(gru_out).transpose(1, 2)
+
+                final_in = torch.cat([y_inv.reshape(batch_size, -1), y_dyn.reshape(batch_size, -1)], dim=-1)
+                fused_quantile_preds = self.final_pred_head(final_in).view(*quantile_preds_shape)
+
+            if self.augment == 'idf_branch_gru_q':
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                q = sequence_output.squeeze(1)
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                alpha = F.softmax(self.ret_score_head(ret_score_in), dim=1)
+                h_ret = (alpha * retrieved_y_enc).sum(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                route_in = torch.cat([h, h_ret], dim=-1)
+                gamma = torch.sigmoid(self.routing_gate(route_in))
+                z_inv = gamma * h
+                z_dyn = (1 - gamma) * h
+
+                y_inv_base = self.inv_pred_head(z_inv)
+                y_inv_res = self.inv_residual_head(z_inv)
+                y_inv = (y_inv_base + y_inv_res).view(*quantile_preds_shape)
+
+                dyn_base = torch.cat([z_dyn, h_ret], dim=-1)
+                dyn_base_seq = dyn_base.unsqueeze(1).repeat(1, self.chronos_config.prediction_length, 1)
+                quantile_step = quantile_preds.transpose(1, 2)
+                dyn_seq = torch.cat([dyn_base_seq, quantile_step], dim=-1)
+                gru_out, _ = self.dyn_gru(dyn_seq)
+                y_dyn = self.dyn_out_head(gru_out).transpose(1, 2)
+
+                final_in = torch.cat([y_inv.reshape(batch_size, -1), y_dyn.reshape(batch_size, -1)], dim=-1)
+                fused_quantile_preds = self.final_pred_head(final_in).view(*quantile_preds_shape)
+
+            if self.augment == 'idf_dual_direct_head':
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                q = sequence_output.squeeze(1)
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                alpha = F.softmax(self.ret_score_head(ret_score_in), dim=1)
+                h_ret = (alpha * retrieved_y_enc).sum(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                route_in = torch.cat([h, h_ret], dim=-1)
+                gamma = torch.sigmoid(self.routing_gate(route_in))
+                z_inv = gamma * h
+                z_dyn = (1 - gamma) * h
+
+                h_inv = self.inv_hidden_proj(z_inv)
+                h_dyn = self.dyn_ret_hidden_proj(torch.cat([z_dyn, h_ret], dim=-1))
+
+                y_inv = self.output_patch_embedding(h_inv.unsqueeze(1)).view(*quantile_preds_shape)
+                y_dyn = self.output_patch_embedding(h_dyn.unsqueeze(1)).view(*quantile_preds_shape)
+
+                final_in = torch.cat([y_inv.reshape(batch_size, -1), y_dyn.reshape(batch_size, -1)], dim=-1)
+                fused_quantile_preds = self.final_pred_head(final_in).view(*quantile_preds_shape)
+
+            if self.augment == 'idf_residual':
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                q = sequence_output.squeeze(1)
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                alpha = F.softmax(self.ret_score_head(ret_score_in), dim=1)
+                h_ret = (alpha * retrieved_y_enc).sum(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                route_in = torch.cat([h, h_ret], dim=-1)
+                gamma = torch.sigmoid(self.routing_gate(route_in))
+                z_inv = gamma * h
+                z_dyn = (1 - gamma) * h
+
+                delta_inv = self.inv_pred_head(z_inv).view(*quantile_preds_shape)
+                dyn_in = torch.cat([z_dyn, h_ret], dim=-1)
+                delta_dyn = self.dyn_pred_head(dyn_in).view(*quantile_preds_shape)
+                delta = torch.tanh(delta_inv + delta_dyn) * 2
+
+                fused_quantile_preds = quantile_preds + delta
+
+            if self.augment == 'idf_dual_projector':
+                tau = float(getattr(self, "tau", 0.1))
+                tau = max(tau, 1e-6)
+
+                q = sequence_output.squeeze(1)
+                q_i = self._encode_context_hidden(retrieved_x.reshape(batch_size * r_M, -1)).reshape(batch_size, r_M, -1)
+
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                score = F.cosine_similarity(q_expand, q_i, dim=-1).unsqueeze(-1) / tau
+                alpha = torch.softmax(score, dim=1)
+                h_ret = (alpha * q_i).sum(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                r_ret = q - h_ret
+                z_inv = self.g_inv(torch.cat([h, h_ret], dim=-1))
+                z_dyn = self.g_dyn(torch.cat([h, r_ret], dim=-1))
+
+                h_ret_expand = h_ret.unsqueeze(1).expand(-1, r_M, -1)
+                z_inv_i = self.g_inv(torch.cat([q_i, h_ret_expand], dim=-1).reshape(batch_size * r_M, -1)).reshape(batch_size, r_M, -1)
+
+                y_inv = self.f_inv(z_inv).view(*quantile_preds_shape)
+                y_dyn = self.f_dyn(z_dyn).view(*quantile_preds_shape)
+                y_hat = y_inv + y_dyn
+                fused_quantile_preds = y_hat
+
+                dual_projector_metrics = {
+                    "q": q,
+                    "q_i": q_i,
+                    "alpha": alpha,
+                    "h_ret": h_ret,
+                    "h": h,
+                    "z_inv": z_inv,
+                    "z_dyn": z_dyn,
+                    "z_inv_i": z_inv_i,
+                    "y_inv": y_inv,
+                    "y_dyn": y_dyn,
+                    "y_hat": y_hat,
+                }
+
+                self._debug_print_dual_projector_shapes(**dual_projector_metrics)
+
+            if self.augment == 'idf_dual_projector_mlp':
+                tau = float(getattr(self, "tau", 0.1))
+                tau = max(tau, 1e-6)
+
+                q = sequence_output.squeeze(1)
+                q_i = self.retrieved_x_encoder_mlp(retrieved_x)
+
+                q_expand = q.unsqueeze(1).expand(-1, r_M, -1)
+                score = F.cosine_similarity(q_expand, q_i, dim=-1).unsqueeze(-1) / tau
+                alpha = torch.softmax(score, dim=1)
+                h_ret = (alpha * q_i).sum(dim=1)
+
+                fuse_in = torch.cat([q, h_ret], dim=-1)
+                fuse_lambda = torch.sigmoid(self.fuse_gate(fuse_in))
+                h = fuse_lambda * q + (1 - fuse_lambda) * h_ret
+
+                r_ret = q - h_ret
+                z_inv = self.g_inv(torch.cat([h, h_ret], dim=-1))
+                z_dyn = self.g_dyn(torch.cat([h, r_ret], dim=-1))
+
+                h_ret_expand = h_ret.unsqueeze(1).expand(-1, r_M, -1)
+                z_inv_i = self.g_inv(torch.cat([q_i, h_ret_expand], dim=-1).reshape(batch_size * r_M, -1)).reshape(batch_size, r_M, -1)
+
+                y_inv = self.f_inv(z_inv).view(*quantile_preds_shape)
+                y_dyn = self.f_dyn(z_dyn).view(*quantile_preds_shape)
+                y_hat = y_inv + y_dyn
+                fused_quantile_preds = y_hat
+
+                dual_projector_metrics = {
+                    "q": q,
+                    "q_i": q_i,
+                    "alpha": alpha,
+                    "h_ret": h_ret,
+                    "h": h,
+                    "z_inv": z_inv,
+                    "z_dyn": z_dyn,
+                    "z_inv_i": z_inv_i,
+                    "y_inv": y_inv,
+                    "y_dyn": y_dyn,
+                    "y_hat": y_hat,
+                }
+
+                self._debug_print_dual_projector_shapes(**dual_projector_metrics)
+
+            if self.augment == 'idf_trr_dualpath':
+                # h_r 的聚合方式复用 idf_clean_dis 那一套（对应方案文档第2节
+                # h_i^r = sum_k omega_i,k * e_hat_k^r，omega 是对 query/检索未来
+                # 相似度做 softmax），跟 idf_dual_projector 系列不同的是：那边
+                # 是编码 retrieved_x（近邻的历史），这里按文档要求编码
+                # retrieved_y（近邻的未来），并且不经过任何 gate 把 e_q 和 h_r
+                # 混合成一个 h —— 两条路径的输入分别直接由 e_q 和 h_r 拼出来。
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                e_q = sequence_output.squeeze(1)
+                q_expand = e_q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                omega = F.softmax(self.ret_score_head(ret_score_in), dim=1)
+                h_r = (omega * retrieved_y_enc).sum(dim=1)
+
+                # Stage 4：退回方案文档3.1节的原始拼接方式，不做归一化(诊断分支的
+                # eq_norm/hr_norm 已确认跟塌缩比例没有单调关系，见上面 __init__ 里的说明)。
+                z_inv_in = torch.cat([e_q, h_r, e_q * h_r, torch.abs(e_q - h_r)], dim=-1)
+                z_dyn_in = torch.cat([e_q, e_q - h_r], dim=-1)
+                z_inv = self.P_inv(z_inv_in)
+                z_dyn = self.P_dyn(z_dyn_in)
+
+                y_inv = self.f_inv(z_inv).view(*quantile_preds_shape)
+                y_dyn = self.f_dyn(z_dyn).view(*quantile_preds_shape)
+                # 加法重构（方案文档第3.2节）：不用任何融合解码器重新混合两条路径。
+                fused_quantile_preds = y_inv + y_dyn
+
+                aux_z_inv_trr = z_inv
+                aux_z_dyn_trr = z_dyn
+                aux_e_q_rob = e_q
+                aux_retrieved_y_enc_rob = retrieved_y_enc
+                aux_omega_rob = omega.squeeze(-1)
+
+            if self.augment == 'idf_trr_dualpath_learnfuse':
+                # 前半段(h_r聚合、z_inv_in/z_dyn_in拼接、P_inv/P_dyn)逐字复用
+                # idf_trr_dualpath，唯一区别在最后一行的融合方式。
+                retrieved_y_enc = []
+                for i in range(r_M):
+                    retrieved_y_enc.append(self.encode_mlp(retrieved_y[:, i, :]))
+                retrieved_y_enc = torch.stack(retrieved_y_enc, dim=1)
+
+                e_q = sequence_output.squeeze(1)
+                q_expand = e_q.unsqueeze(1).expand(-1, r_M, -1)
+                ret_score_in = torch.cat([q_expand, retrieved_y_enc], dim=-1)
+                omega = F.softmax(self.ret_score_head(ret_score_in), dim=1)
+                h_r = (omega * retrieved_y_enc).sum(dim=1)
+
+                z_inv_in = torch.cat([e_q, h_r, e_q * h_r, torch.abs(e_q - h_r)], dim=-1)
+                z_dyn_in = torch.cat([e_q, e_q - h_r], dim=-1)
+                z_inv = self.P_inv(z_inv_in)
+                z_dyn = self.P_dyn(z_dyn_in)
+
+                y_inv = self.f_inv(z_inv).view(*quantile_preds_shape)
+                y_dyn = self.f_dyn(z_dyn).view(*quantile_preds_shape)
+                # 唯一区别：不做 y_inv+y_dyn 加法重构，改用老RIDDE(idf_clean_dis)
+                # 那种可学习线性融合头对两路预测做加权组合。
+                final_in = torch.cat([y_inv.reshape(batch_size, -1), y_dyn.reshape(batch_size, -1)], dim=-1)
+                fused_quantile_preds = self.final_pred_head(final_in).view(*quantile_preds_shape)
+
+                aux_z_inv_trr = z_inv
+                aux_z_dyn_trr = z_dyn
+                aux_e_q_rob = e_q
+                aux_retrieved_y_enc_rob = retrieved_y_enc
+                aux_omega_rob = omega.squeeze(-1)
+
+            if self.augment == 'gate':
+                # Step 1
+                retrieved_y = retrieved_y.repeat(1, self.num_quantiles, 1)
+                x = context.unsqueeze(1).repeat(1, self.num_quantiles, 1)
+                stats_preds = compute_time_series_stats(quantile_preds, dim=2, keepdim=True)
+                stats_retrieved = compute_time_series_stats(retrieved_y, dim=2, keepdim=True)
+                stats_x = compute_time_series_stats(x, dim=2, keepdim=True)
+                # Step 2: Concatenate x, retrieved_y, quantile_preds
+                concat_preds = torch.cat([quantile_preds, retrieved_y, x, stats_preds, stats_retrieved, stats_x], dim=-1).view(batch_size, self.num_quantiles, -1)
+                gate = self.gate_layer(concat_preds) + self.gate_linear1(concat_preds)
+                gate = torch.sigmoid(self.gate_linear2(gate))
+                # Step 3: Fuse predictions
+                fused_quantile_preds = gate * quantile_preds + (1 - gate) * retrieved_y
+
+        loss = None
+        loss_forecast = None
+        loss_cons = None
+        loss_smooth = None
+        loss_inv = None
+        loss_dis = None
+        loss_ret = None
+        loss_dyn = None
+        loss_sem = None
+        loss_xcov = None
+        loss_ord = None
+        loss_cos = None
+        loss_gbal = None
+        loss_var = None
+        loss_sep = None
+        loss_delta = None
+        loss_final_mse = None
+        diag_cos_sim = None
+        diag_gamma_mean = None
+        diag_gamma_sat_frac = None
+        diag_roughness_inv = None
+        diag_roughness_dyn = None
+        diag_energy_share_inv = None
+        diag_c_i = None
+        diag_gamma_per_sample = None
+        diag_cos_sim_per_sample = None
+        diag_roughness_inv_per_sample = None
+        diag_roughness_dyn_per_sample = None
+        diag_energy_share_per_sample = None
+        use_disentangle_aux_loss = False
+        aux_loss_enabled = False
+        if target is not None:
+            # normalize target
+            target, _ = self.instance_norm(target, loc_scale)
+            target = target.unsqueeze(1)  # type: ignore
+            assert self.chronos_config.prediction_length >= target.shape[-1]
+
+            target = target.to(fused_quantile_preds.device)
+            target_mask = (
+                target_mask.unsqueeze(1).to(fused_quantile_preds.device) if target_mask is not None else ~torch.isnan(target)
+            )
+            target[~target_mask] = 0.0
+
+            # pad target and target_mask if they are shorter than model's prediction_length
+            if self.chronos_config.prediction_length > target.shape[-1]:
+                padding_shape = (*target.shape[:-1], self.chronos_config.prediction_length - target.shape[-1])
+                target = torch.cat([target, torch.zeros(padding_shape).to(target)], dim=-1)
+                target_mask = torch.cat([target_mask, torch.zeros(padding_shape).to(target_mask)], dim=-1)
+
+            aux_target_rob = target
+
+            loss = (
+                2
+                * torch.abs(
+                    (target - fused_quantile_preds)
+                    * ((target <= fused_quantile_preds).float() - self.quantiles.view(1, self.num_quantiles, 1))
+                )
+                * target_mask.float()
+            )
+            loss = loss.mean(dim=-2)  # Mean over prediction horizon
+            loss = loss.sum(dim=-1)  # Sum over quantile levels
+            # Stage 4 (L_TRR/CVaR) 需要的逐样本损失，在对 batch 取 mean 之前存一份，
+            # 保留计算图(不 detach)，这样主模型的 R_e^ret 按环境分组重新聚合之后
+            # 仍然可以正常反传到 Θ。跟下面 loss=loss.mean() 之后的标量 loss_forecast
+            # 是同一份数据的两种聚合方式，互不影响。
+            loss_forecast_per_sample = loss
+            loss = loss.mean()  # Mean over batch
+
+            loss_forecast = loss
+
+            # FINAL_MSE_OBJECTIVE_PATCH_V1: optimize the quantity used by MSE evaluation.
+            # All tensors are on the same instance-normalized scale as L_pred.
+            # Only the median (q=0.5) of the *fused* prediction is used, so this
+            # term cannot be hidden by either internal branch.
+            central_idx_final_mse = torch.abs(self.quantiles - 0.5).argmin()
+            final_point_pred = fused_quantile_preds[:, central_idx_final_mse, :]
+            final_point_target = target.squeeze(1)
+            final_point_mask = target_mask.squeeze(1).float()
+            final_valid_count = final_point_mask.sum(dim=1).clamp_min(1.0)
+            loss_final_mse_per_sample = (
+                (final_point_pred - final_point_target).pow(2) * final_point_mask
+            ).sum(dim=1) / final_valid_count
+            loss_final_mse = loss_final_mse_per_sample.mean()
+
+            loss_cons = self._zero_loss_like(loss_forecast)
+            loss_smooth = self._zero_loss_like(loss_forecast)
+            loss_inv = self._zero_loss_like(loss_forecast)
+            loss_dis = self._zero_loss_like(loss_forecast)
+            loss_dis_output = self._zero_loss_like(loss_forecast)
+            loss_ret = self._zero_loss_like(loss_forecast)
+            loss_dyn = self._zero_loss_like(loss_forecast)
+            loss_sem = self._zero_loss_like(loss_forecast)
+            loss_xcov = self._zero_loss_like(loss_forecast)
+            loss_ord = self._zero_loss_like(loss_forecast)
+            loss_cos = self._zero_loss_like(loss_forecast)
+            loss_gbal = self._zero_loss_like(loss_forecast)
+            diag_cos_sim = self._zero_loss_like(loss_forecast)
+            diag_gamma_mean = self._zero_loss_like(loss_forecast)
+            diag_gamma_sat_frac = self._zero_loss_like(loss_forecast)
+            diag_roughness_inv = self._zero_loss_like(loss_forecast)
+            diag_roughness_dyn = self._zero_loss_like(loss_forecast)
+            diag_energy_share_inv = self._zero_loss_like(loss_forecast)
+            loss_var = self._zero_loss_like(loss_forecast)
+            loss_sep = self._zero_loss_like(loss_forecast)
+
+            if self.augment in ('idf_trr_dualpath', 'idf_trr_dualpath_learnfuse'):
+                assert aux_z_inv_trr is not None and aux_z_dyn_trr is not None, \
+                    "idf_trr_dualpath 的 z_inv/z_dyn 应该在 forward 里已经算好了"
+                z_inv, z_dyn = aux_z_inv_trr, aux_z_dyn_trr
+
+                # L_xcov（方案文档4.4节 Eq: 交叉协方差的 Frobenius 范数）：
+                # 复用已有的 loss_xcov 字段，公式跟 idf_ridde_v2 的 xcov 一样，
+                # 只是这里的 z_inv/z_dyn 来自双路径投影器而不是 gamma 门控切分。
+                z_inv_c = z_inv - z_inv.mean(dim=0, keepdim=True)
+                z_dyn_c = z_dyn - z_dyn.mean(dim=0, keepdim=True)
+                Bsz = z_inv_c.shape[0]
+                xcov = (z_inv_c.t() @ z_dyn_c) / max(Bsz - 1, 1)
+                d_inv, d_dyn = z_inv.shape[-1], z_dyn.shape[-1]
+                loss_xcov = xcov.pow(2).sum() / (d_inv * d_dyn)
+
+                # L_var（方案文档4.5节 防塌缩方差下界）：任何一条路径的某个维度，
+                # 如果在这个 batch 里方差掉到 gamma_0 以下，就惩罚它，防止
+                # xcov 项通过"让某条路径塌缩成batch常数"来偷懒把协方差压到0。
+                gamma0_var = float(getattr(self, "gamma0_var", 0.1))
+
+                def _var_floor(z):
+                    std = torch.sqrt(z.var(dim=0) + 1e-8)
+                    return torch.clamp(gamma0_var - std, min=0.0).mean()
+
+                loss_var = _var_floor(z_inv) + _var_floor(z_dyn)
+                beta_var = float(getattr(self, "beta_var", 1.0))
+                loss_sep = loss_xcov + beta_var * loss_var
+
+                lambda_sep = float(getattr(self, "lambda_sep", 0.0))
+                # Stage 3: 先不接 L_TRR，只用 L_pred + lambda_sep*L_sep。
+                loss = loss_forecast + lambda_sep * loss_sep
+
+                with torch.no_grad():
+                    var_inv_mean = z_inv.var(dim=0).mean()
+                    var_dyn_mean = z_dyn.var(dim=0).mean()
+                    diag_energy_share_inv = var_inv_mean / (var_inv_mean + var_dyn_mean + 1e-8)
+
+            if self.augment == 'idf_ridde_v2':
+                assert ridde_v2_metrics is not None, "idf_ridde_v2 metrics should be populated during forward"
+                m = ridde_v2_metrics
+                target_sq = target.squeeze(1)  # (B, L), query-frame normalized
+
+                # Eq.18: residual of ground truth vs. retrieval consensus
+                r_i = target_sq - m["y_bar_r"]  # (B, L)
+
+                # Eq.19: retrieval-confidence score c_i (not learnable, no grad)
+                diff_k = m["retrieved_y_qframe"] - m["y_bar_r"].unsqueeze(1)  # (B, r_M, L)
+                u_num = (m["alpha"].squeeze(-1) * diff_k.pow(2).sum(dim=-1)).sum(dim=1)  # (B,)
+                ybar_mean = m["y_bar_r"].mean(dim=-1, keepdim=True)
+                u_den = (m["y_bar_r"] - ybar_mean).pow(2).sum(dim=-1) + 1e-8
+                tau = max(float(getattr(self, "tau", 0.1)), 1e-6)
+                c_i = torch.exp(-(u_num / u_den) / tau).detach()  # (B,)
+
+                # Eq.20: semantic anchoring loss (broadcast retrieval targets over
+                # the quantile dimension, mirroring how the pinball loss above
+                # broadcasts `target` against all quantiles)
+                y_bar_r_b = m["y_bar_r"].unsqueeze(1).detach()  # (B,1,L)
+                r_i_b = r_i.unsqueeze(1).detach()
+                sem_inv = (m["y_inv"] - y_bar_r_b).pow(2).mean(dim=(1, 2))
+                sem_dyn = (m["y_dyn"] - r_i_b).pow(2).mean(dim=(1, 2))
+                loss_sem = (c_i * (sem_inv + sem_dyn)).mean()
+
+                # Eq.21: batch-level de-correlation (single-batch degenerate form,
+                # per the ablation checklist's resolution of the M_b ambiguity)
+                z_inv_c = m["z_inv"] - m["z_inv"].mean(dim=0, keepdim=True)
+                z_dyn_c = m["z_dyn"] - m["z_dyn"].mean(dim=0, keepdim=True)
+                B = z_inv_c.shape[0]
+                xcov = (z_inv_c.t() @ z_dyn_c) / max(B - 1, 1)
+                loss_xcov = xcov.pow(2).sum()
+
+                # Eq.22-23: relative smoothness ranking (dynamic branch should be
+                # rougher than the invariant branch by at least `ord_margin`)
+                ord_margin = float(getattr(self, "ord_margin", 0.0))
+
+                def _roughness(y):  # y: (B, Q, L) -> (B, Q)
+                    d2 = y[..., 2:] - 2 * y[..., 1:-1] + y[..., :-2]
+                    return torch.log(d2.var(dim=-1) + 1e-8)
+
+                R_inv = _roughness(m["y_inv"]).mean(dim=1)  # (B,)
+                R_dyn = _roughness(m["y_dyn"]).mean(dim=1)
+                loss_ord = (c_i * torch.clamp(R_inv - R_dyn + ord_margin, min=0.0)).mean()
+
+                # Alternative/complementary decorrelation losses (see
+                # RIDDE_ver2.0_xcov消融实验报告.md's recommendations): L_xcov's
+                # batch-covariance form was found to be gameable by collapsing
+                # gamma toward 0 uniformly (z_inv -> a batch-constant, which
+                # trivially zeroes the batch covariance without any real
+                # within-sample decorrelation). These two terms target that
+                # failure mode directly instead.
+                #
+                # loss_cos: penalizes within-sample cos_sim(z_inv, z_dyn)
+                # directly (this quantity is provably >= 0, see xcov report
+                # sec.4, so no abs/square needed).
+                cos_sim_sample = F.cosine_similarity(m["z_inv"], m["z_dyn"], dim=-1)  # (B,)
+                loss_cos = cos_sim_sample.mean()
+
+                # loss_gbal: penalizes gamma's global mean drifting away from
+                # 0.5, discouraging the routing gate from collapsing nearly
+                # all mass onto one branch.
+                loss_gbal = (m["gamma"].mean() - 0.5) ** 2
+
+                rho_sem = float(getattr(self, "rho_sem", 0.0))
+                rho_xcov = float(getattr(self, "rho_xcov", 0.0))
+                rho_ord = float(getattr(self, "rho_ord", 0.0))
+                rho_cos = float(getattr(self, "rho_cos", 0.0))
+                rho_gbal = float(getattr(self, "rho_gbal", 0.0))
+                loss = (loss_forecast + rho_sem * loss_sem + rho_xcov * loss_xcov + rho_ord * loss_ord
+                        + rho_cos * loss_cos + rho_gbal * loss_gbal)
+
+                # Diagnostics (cheap, reuse tensors already computed above). Both a
+                # batch-mean scalar (for cheap per-step wandb logging) and the raw
+                # per-sample (B,) tensor (for post-hoc stratified analysis, e.g.
+                # ridde_v2_diagnostics.py's c_i-quartile MSE/MAE breakdown) are kept.
+                with torch.no_grad():
+                    z_inv_n = F.normalize(m["z_inv"], dim=-1)
+                    z_dyn_n = F.normalize(m["z_dyn"], dim=-1)
+                    diag_cos_sim_per_sample = (z_inv_n * z_dyn_n).sum(dim=-1).abs()
+                    diag_cos_sim = diag_cos_sim_per_sample.mean()
+                    diag_gamma_per_sample = m["gamma"].mean(dim=-1)
+                    diag_gamma_mean = diag_gamma_per_sample.mean()
+                    diag_gamma_sat_frac = ((m["gamma"] < 0.1) | (m["gamma"] > 0.9)).float().mean()
+                    diag_roughness_inv_per_sample = R_inv
+                    diag_roughness_dyn_per_sample = R_dyn
+                    diag_roughness_inv = R_inv.mean()
+                    diag_roughness_dyn = R_dyn.mean()
+                    var_inv = m["y_inv"].var(dim=-1).mean(dim=1)  # (B,)
+                    var_dyn = m["y_dyn"].var(dim=-1).mean(dim=1)
+                    diag_energy_share_per_sample = var_inv / (var_inv + var_dyn + 1e-8)
+                    diag_energy_share_inv = diag_energy_share_per_sample.mean()
+                    diag_c_i = c_i
+
+            if self.augment in ['idf_dual_projector', 'idf_dual_projector_mlp']:
+                assert dual_projector_metrics is not None, "idf_dual_projector metrics should be populated during forward"
+                y_inv = dual_projector_metrics["y_inv"]
+                y_dyn = dual_projector_metrics["y_dyn"]
+                z_inv = dual_projector_metrics["z_inv"]
+                z_dyn = dual_projector_metrics["z_dyn"]
+                z_inv_i = dual_projector_metrics["z_inv_i"]
+
+                z_inv_expand = z_inv.unsqueeze(1)
+                loss_cons = ((z_inv_expand - z_inv_i) ** 2).sum(dim=-1).mean(dim=1).mean()
+
+                y_inv_diff = y_inv[..., 1:] - y_inv[..., :-1]
+                loss_smooth = (y_inv_diff ** 2).mean()
+
+                loss_dis = ((z_inv * z_dyn).sum(dim=-1) ** 2).mean()
+
+                res_target = target - y_inv.detach()
+                loss_dyn = ((y_dyn - res_target) ** 2).mean()
+
+                lambda1 = float(getattr(self, "lambda1", 0.0))
+                lambda2 = float(getattr(self, "lambda2", 0.0))
+                loss = loss_forecast + lambda1 * (loss_cons + loss_smooth + loss_dis) + lambda2 * loss_dyn
+
+            use_disentangle_aux_loss = all(
+                tensor is not None for tensor in (aux_h_ret, aux_z_inv, aux_z_dyn, aux_y_inv, aux_y_dyn)
+            )
+            rho1 = float(getattr(self, "rho1", 0.0))
+            rho2 = float(getattr(self, "rho2", 0.0))
+            rho3 = float(getattr(self, "rho3", 0.0))
+            rho4 = float(getattr(self, "rho4", 0.0))
+            rho_dis_output = float(getattr(self, "rho_dis_output", 0.0))
+            # dis_mode selects which disentanglement term(s) actually enter the total loss:
+            #   'latent'  -> only L_dis on z_inv/z_dyn (rho2), matches the original RIDDE paper
+            #   'output'  -> only L_dis on y_hat_inv/y_hat_dyn (rho_dis_output)
+            #   'both'    -> both terms with their own independent weights
+            # Both loss_dis and loss_dis_output are still computed/logged regardless of mode
+            # for observability; only their contribution to `loss` is gated here.
+            dis_mode = getattr(self, "dis_mode", "latent")
+            rho2_eff = rho2 if dis_mode in ("latent", "both") else 0.0
+            rho_dis_output_eff = rho_dis_output if dis_mode in ("output", "both") else 0.0
+            aux_loss_enabled = (
+                use_disentangle_aux_loss
+                and (
+                    any(rho > 0.0 for rho in (rho1, rho2_eff, rho3, rho4, rho_dis_output_eff))
+                    or self.augment in ('idf_clean_dis_v3', 'idf_clean_dis_v4')
+                )
+            ) or (
+                self.augment == 'idf_dual_projector'
+                and any(v > 0.0 for v in (
+                    float(getattr(self, "lambda1", 0.0)),
+                    float(getattr(self, "lambda2", 0.0)),
+                ))
+            ) or (
+                self.augment == 'idf_dual_projector_mlp'
+                and any(v > 0.0 for v in (
+                    float(getattr(self, "lambda1", 0.0)),
+                    float(getattr(self, "lambda2", 0.0)),
+                ))
+            )
+
+            if aux_loss_enabled:
+                if self.augment not in ['idf_dual_projector', 'idf_dual_projector_mlp']:
+                    inv_target = aux_z_inv.detach()
+                    dyn_target = aux_z_dyn.detach()
+                    y_inv_hidden = self.inv_aux_backproj(aux_y_inv.reshape(batch_size, -1))
+                    y_dyn_hidden = self.dyn_aux_backproj(aux_y_dyn.reshape(batch_size, -1))
+
+                    loss_inv = F.mse_loss(y_inv_hidden, inv_target)
+
+                    if self.augment in ('idf_clean_dis_v3', 'idf_clean_dis_v4'):
+                        # RIDDE_带容差的门控重叠目标函数：L_dis^rel = mean([r_i - tau]_+^2)
+                        # r_i = 4*(z_inv^T z_dyn) / (||h||^2 + eps)，h = z_inv + z_dyn
+                        # （架构恒等式，已用真实数据验证：10个batch误差都在1e-7量级，float32精度范围内）
+                        _z_inv_flat = aux_z_inv.flatten(1)
+                        _z_dyn_flat = aux_z_dyn.flatten(1)
+                        _h_flat = _z_inv_flat + _z_dyn_flat
+                        _s_i = (_z_inv_flat * _z_dyn_flat).sum(dim=-1)
+                        _E_i = (_h_flat ** 2).sum(dim=-1)
+                        _eps_dis = 1e-8
+                        r_i = 4 * _s_i / (_E_i + _eps_dis)
+                        tau_dis = getattr(self, "tau_dis", 0.17)
+                        per_sample_loss_dis = (r_i - tau_dis).clamp_min(0.0).pow(2)
+                        c_i_dis = None
+                        if (
+                            getattr(self, "weight_dis_by_ci", False)
+                            and self.augment == 'idf_clean_dis_v4'
+                            and v4_metrics is not None
+                        ):
+                            m_dis = v4_metrics
+                            diff_k_dis = m_dis["retrieved_y_qframe"] - m_dis["y_bar_r"].unsqueeze(1)
+                            u_num_dis = (m_dis["alpha"].squeeze(-1) * diff_k_dis.pow(2).sum(dim=-1)).sum(dim=1)
+                            ybar_mean_dis = m_dis["y_bar_r"].mean(dim=-1, keepdim=True)
+                            u_den_dis = (m_dis["y_bar_r"] - ybar_mean_dis).pow(2).sum(dim=-1) + 1e-8
+                            tau_sem_dis = max(float(getattr(self, "tau", 0.1)), 1e-6)
+                            u_ratio_dis = (u_num_dis / u_den_dis).detach()
+                            c_i_dis = torch.exp(-u_ratio_dis / tau_sem_dis)
+                            if getattr(self, "disable_ci", False):
+                                c_i_dis = torch.ones_like(u_ratio_dis)
+                            loss_dis = (c_i_dis * per_sample_loss_dis).mean()
+                        else:
+                            loss_dis = per_sample_loss_dis.mean()
+                        if self.training:
+                            with torch.no_grad():
+                                dis_active_frac = (r_i > tau_dis).float().mean()
+                                print(f"[idf_clean_dis_v3] tau={tau_dis:.4f} r_i.mean={r_i.mean().item():.4f} "
+                                      f"active_frac={dis_active_frac.item():.4f} loss_dis={loss_dis.item():.6f}")
+                                if c_i_dis is not None:
+                                    print(f"[idf_clean_dis_v4_dis_ci] weight_dis_by_ci=True c_i_dis.mean={c_i_dis.mean().item():.4f} "
+                                          f"c_i_dis<0.01占比={(c_i_dis < 0.01).float().mean().item():.2%}")
+                                print(f"[idf_clean_dis_v3_ratio] rho2={rho2:.6g} "
+                                      f"loss_dis_raw={loss_dis.item():.10e} "
+                                      f"loss_forecast_raw={loss_forecast.item():.10e}")
+                                # 诊断：区分"真解耦"(z_inv/z_dyn都保持非退化范数，方向趋于正交)
+                                # 还是"gamma坍缩到0/1"(某一支范数被压到接近0，r_i自然趋近0，
+                                # 但不代表真的学到了解耦)——纯读现有中间变量，不参与反传。
+                                _z_inv_sqnorm = _z_inv_flat.pow(2).sum(dim=-1)
+                                _z_dyn_sqnorm = _z_dyn_flat.pow(2).sum(dim=-1)
+                                _z_inv_norm = _z_inv_flat.norm(dim=-1)
+                                _z_dyn_norm = _z_dyn_flat.norm(dim=-1)
+                                _cos_i = _s_i / (_z_inv_norm * _z_dyn_norm + 1e-12)
+                                _gamma_flat = aux_gamma_v3.flatten(1).mean(dim=-1) if aux_gamma_v3 is not None else None
+                                if _gamma_flat is not None:
+                                    _gamma_mean = _gamma_flat.mean().item()
+                                    _gamma_frac_near_0 = (_gamma_flat < 0.05).float().mean().item()
+                                    _gamma_frac_near_1 = (_gamma_flat > 0.95).float().mean().item()
+                                    _gamma_frac_near_0_loose = (_gamma_flat < 0.1).float().mean().item()
+                                    _gamma_frac_near_1_loose = (_gamma_flat > 0.9).float().mean().item()
+                                else:
+                                    _gamma_mean = _gamma_frac_near_0 = _gamma_frac_near_1 = float('nan')
+                                    _gamma_frac_near_0_loose = _gamma_frac_near_1_loose = float('nan')
+                                print(f"[idf_clean_dis_v3_gamma] gamma.mean={_gamma_mean:.4f} "
+                                      f"frac_near_0(<0.05)={_gamma_frac_near_0:.4f} "
+                                      f"frac_near_1(>0.95)={_gamma_frac_near_1:.4f} "
+                                      f"frac_near_0_loose(<0.1)={_gamma_frac_near_0_loose:.4f} "
+                                      f"frac_near_1_loose(>0.9)={_gamma_frac_near_1_loose:.4f} "
+                                      f"sat_loose(0.1/0.9 total)={(_gamma_frac_near_0_loose + _gamma_frac_near_1_loose):.4f}")
+                                print(f"[idf_clean_dis_v3_norm] z_inv_sqnorm.mean={_z_inv_sqnorm.mean().item():.6f} "
+                                      f"z_dyn_sqnorm.mean={_z_dyn_sqnorm.mean().item():.6f} "
+                                      f"cos_i.mean={_cos_i.mean().item():.6f} "
+                                      f"abs_cos_i.mean={_cos_i.abs().mean().item():.6f}")
+                    else:
+                        z_inv_n = F.normalize(aux_z_inv.flatten(1), dim=-1)
+                        z_dyn_n = F.normalize(aux_z_dyn.flatten(1), dim=-1)
+                        loss_dis = (z_inv_n * z_dyn_n).sum(dim=-1).abs().mean()   # |cos(z_inv, z_dyn)| 的均值，其他模式不变
+
+                    lambda_sem = float(getattr(self, "lambda_sem", 0.0))
+                    lambda_ord = float(getattr(self, "lambda_ord", 0.0))
+                    if self.augment == 'idf_clean_dis_v4' and v4_metrics is not None:
+                        m = v4_metrics
+                        target_sq = target.squeeze(1)
+                        r_i_sem = target_sq - m["y_bar_r"]
+                        diff_k = m["retrieved_y_qframe"] - m["y_bar_r"].unsqueeze(1)
+                        u_num = (m["alpha"].squeeze(-1) * diff_k.pow(2).sum(dim=-1)).sum(dim=1)
+                        ybar_mean = m["y_bar_r"].mean(dim=-1, keepdim=True)
+                        u_den = (m["y_bar_r"] - ybar_mean).pow(2).sum(dim=-1) + 1e-8
+                        tau_sem = max(float(getattr(self, "tau", 0.1)), 1e-6)
+                        u_ratio = (u_num / u_den).detach()
+                        c_i = torch.exp(-u_ratio / tau_sem)
+                        if getattr(self, "disable_ci", False):
+                            c_i = torch.ones_like(u_ratio)
+                        y_bar_r_b = m["y_bar_r"].unsqueeze(1).detach()
+                        r_i_sem_b = r_i_sem.unsqueeze(1).detach()
+                        sem_inv = (m["y_inv"] - y_bar_r_b).pow(2).mean(dim=(1, 2))
+                        sem_dyn = (m["y_dyn"] - r_i_sem_b).pow(2).mean(dim=(1, 2))
+                        loss_sem = (c_i * (sem_inv + sem_dyn)).mean()
+                        if self.training:
+                            with torch.no_grad():
+                                c_i_frac_near_0 = (c_i < 0.01).float().mean().item()
+                                c_i_frac_low = (c_i < 0.1).float().mean().item()
+                                print(f"[idf_clean_dis_v4_sem] loss_sem={loss_sem.item():.6f} "
+                                      f"c_i.mean={c_i.mean().item():.4f} c_i.min={c_i.min().item():.6f} "
+                                      f"c_i.max={c_i.max().item():.4f} c_i<0.01占比={c_i_frac_near_0:.2%} "
+                                      f"c_i<0.1占比={c_i_frac_low:.2%} lambda_sem={lambda_sem:.6g}")
+                                print(f"[idf_clean_dis_v4_ci] c_i: mean={c_i.mean().item():.4f} "
+                                      f"std={c_i.std().item():.4f} min={c_i.min().item():.4f} "
+                                      f"max={c_i.max().item():.4f} | u_ratio(pre-tau): "
+                                      f"mean={u_ratio.mean().item():.4f} std={u_ratio.std().item():.4f} "
+                                      f"min={u_ratio.min().item():.4f} max={u_ratio.max().item():.4f} "
+                                      f"tau={tau_sem:.4g}")
+
+                        # L_ord (idf_ridde_v2 Eq.22-23，公式原样复用): 复用上面同一个
+                        # c_i(Eq.19置信度权重)，粗糙度用y_inv/y_dyn(预测空间)算，
+                        # 不依赖lambda_sem是否>0。
+                        ord_margin_v4 = float(getattr(self, "ord_margin", 0.0))
+
+                        def _roughness_v4(y):  # y: (B, Q, L) -> (B, Q)
+                            d2 = y[..., 2:] - 2 * y[..., 1:-1] + y[..., :-2]
+                            return torch.log(d2.var(dim=-1) + 1e-8)
+
+                        R_inv_v4 = _roughness_v4(m["y_inv"]).mean(dim=1)
+                        R_dyn_v4 = _roughness_v4(m["y_dyn"]).mean(dim=1)
+                        loss_ord = (c_i * torch.clamp(R_inv_v4 - R_dyn_v4 + ord_margin_v4, min=0.0)).mean()
+                        if self.training:
+                            with torch.no_grad():
+                                print(f"[idf_clean_dis_v4_ord] loss_ord={loss_ord.item():.6f} "
+                                      f"R_inv.mean={R_inv_v4.mean().item():.4f} R_dyn.mean={R_dyn_v4.mean().item():.4f} "
+                                      f"lambda_ord={lambda_ord:.6g}")
+                    else:
+                        loss_sem = torch.zeros((), device=loss_forecast.device)
+                        loss_ord = torch.zeros((), device=loss_forecast.device)
+
+                    # L_xcov (idf_ridde_v2公式原样复用): 只需要z_inv/z_dyn(门控隐空间)，
+                    # 跟v4_metrics/lambda_sem无关，v3/v4共享分支都能算。
+                    lambda_xcov = float(getattr(self, "lambda_xcov", 0.0))
+                    if self.augment in ('idf_clean_dis_v3', 'idf_clean_dis_v4'):
+                        z_inv_flat_xcov = aux_z_inv.flatten(1)
+                        z_dyn_flat_xcov = aux_z_dyn.flatten(1)
+                        z_inv_c_xcov = z_inv_flat_xcov - z_inv_flat_xcov.mean(dim=0, keepdim=True)
+                        z_dyn_c_xcov = z_dyn_flat_xcov - z_dyn_flat_xcov.mean(dim=0, keepdim=True)
+                        Bsz_xcov = z_inv_c_xcov.shape[0]
+                        xcov_v4 = (z_inv_c_xcov.t() @ z_dyn_c_xcov) / max(Bsz_xcov - 1, 1)
+                        loss_xcov = xcov_v4.pow(2).sum()
+                        if self.training:
+                            with torch.no_grad():
+                                print(f"[idf_clean_dis_v4_xcov] loss_xcov={loss_xcov.item():.6f} "
+                                      f"lambda_xcov={lambda_xcov:.6g}")
+                    else:
+                        loss_xcov = torch.zeros((), device=loss_forecast.device)
+
+                    # L_Delta: 一阶差分Huber loss，约束fused_quantile_preds的中位数
+                    # 分位数轨迹贴近真实值的局部变化率，v3/v4共享分支都能算(跟lambda_sem
+                    # 是否>0无关，只需要fused_quantile_preds/target/target_mask)。
+                    lambda_delta = float(getattr(self, "lambda_delta", 0.0))
+                    if self.augment in ('idf_clean_dis_v3', 'idf_clean_dis_v4'):
+                        central_idx = torch.abs(self.quantiles - 0.5).argmin()
+                        median_pred = fused_quantile_preds[:, central_idx, :]  # (B, L)
+                        target_sq_delta = target.squeeze(1)  # (B, L)
+                        mask_sq_delta = target_mask.squeeze(1)  # (B, L)
+                        delta_yhat = median_pred[:, 1:] - median_pred[:, :-1]  # (B, L-1)
+                        delta_y = target_sq_delta[:, 1:] - target_sq_delta[:, :-1]  # (B, L-1)
+                        mask_delta = (mask_sq_delta[:, 1:] * mask_sq_delta[:, :-1]).float()  # (B, L-1)
+                        huber_kappa = float(getattr(self, "huber_kappa", 1.0))
+                        huber_elem = F.huber_loss(delta_yhat, delta_y, delta=huber_kappa, reduction='none')
+                        valid_count = mask_delta.sum(dim=1).clamp_min(1.0)  # (B,)
+                        per_sample_loss_delta = (huber_elem * mask_delta).sum(dim=1) / valid_count  # (B,)
+                        loss_delta = per_sample_loss_delta.mean()
+                        if self.training:
+                            with torch.no_grad():
+                                print(f"[idf_clean_dis_v4_delta] loss_delta={loss_delta.item():.6f} "
+                                      f"mask_delta_frac={mask_delta.mean().item():.4f} lambda_delta={lambda_delta:.6g}")
+                    else:
+                        loss_delta = torch.zeros((), device=loss_forecast.device)
+
+                    # Output-level counterpart of loss_dis: same cosine-abs-mean form,
+                    # applied to the flattened prediction-head outputs y_hat_inv/y_hat_dyn
+                    # (B, num_quantiles, L) -> (B, num_quantiles * L) instead of z_inv/z_dyn.
+                    y_inv_n = F.normalize(aux_y_inv.reshape(batch_size, -1), dim=-1)
+                    y_dyn_n = F.normalize(aux_y_dyn.reshape(batch_size, -1), dim=-1)
+                    loss_dis_output = (y_inv_n * y_dyn_n).sum(dim=-1).abs().mean()
+
+                    ret_target = aux_h_ret.detach() if getattr(self, "aux_loss_detach_ret", True) else aux_h_ret
+                    loss_ret = F.mse_loss(aux_z_inv, ret_target)
+
+                    mse_dyn = F.mse_loss(y_dyn_hidden, dyn_target)
+                    dyn_margin = float(getattr(self, "dyn_margin", 1.0))
+                    loss_dyn = -torch.clamp(mse_dyn, max=dyn_margin)
+                    loss = (
+                        loss_forecast
+                        + rho1 * loss_inv
+                        + rho2_eff * loss_dis
+                        + rho3 * loss_ret
+                        + rho4 * loss_dyn
+                        + rho_dis_output_eff * loss_dis_output
+                        + lambda_sem * loss_sem
+                        + lambda_ord * loss_ord
+                        + lambda_xcov * loss_xcov
+                        + lambda_delta * loss_delta
+                    )
+
+        # FINAL_MSE_OBJECTIVE_PATCH_V1: add after all legacy terms, exactly once.
+        if target is not None:
+            lambda_final_mse = float(getattr(self, "lambda_final_mse", 0.0))
+            loss = loss + lambda_final_mse * loss_final_mse
+
+        # Unscale predictions
+        fused_quantile_preds = self.instance_norm.inverse(
+            fused_quantile_preds.view(batch_size, -1),
+            loc_scale,
+        ).view(*quantile_preds_shape)
+
+        return ChronosBoltOutput(
+            loss=loss,
+            total_loss=loss,
+            loss_forecast=loss_forecast,
+            loss_forecast_per_sample=loss_forecast_per_sample,
+            loss_cons=loss_cons,
+            loss_smooth=loss_smooth,
+            loss_inv=loss_inv,
+            loss_dis=loss_dis,
+            loss_dis_output=loss_dis_output,
+            loss_ret=loss_ret,
+            loss_dyn=loss_dyn,
+            loss_sem=loss_sem,
+            loss_xcov=loss_xcov,
+            loss_ord=loss_ord,
+            loss_delta=loss_delta,
+            loss_final_mse=loss_final_mse,
+            loss_cos=loss_cos,
+            loss_gbal=loss_gbal,
+            loss_var=loss_var,
+            loss_sep=loss_sep,
+            diag_cos_sim=diag_cos_sim,
+            diag_gamma_mean=diag_gamma_mean,
+            diag_gamma_sat_frac=diag_gamma_sat_frac,
+            diag_roughness_inv=diag_roughness_inv,
+            diag_roughness_dyn=diag_roughness_dyn,
+            diag_energy_share_inv=diag_energy_share_inv,
+            diag_c_i=diag_c_i,
+            diag_gamma_per_sample=diag_gamma_per_sample,
+            diag_cos_sim_per_sample=diag_cos_sim_per_sample,
+            diag_roughness_inv_per_sample=diag_roughness_inv_per_sample,
+            diag_roughness_dyn_per_sample=diag_roughness_dyn_per_sample,
+            diag_energy_share_per_sample=diag_energy_share_per_sample,
+            y_inv=aux_y_inv,
+            y_dyn=aux_y_dyn,
+            use_disentangle_aux_loss=use_disentangle_aux_loss,
+            aux_loss_enabled=aux_loss_enabled,
+            quantile_preds=fused_quantile_preds,
+            aux_e_q_rob=aux_e_q_rob,
+            aux_retrieved_y_enc_rob=aux_retrieved_y_enc_rob,
+            aux_omega_rob=aux_omega_rob,
+            aux_target_rob=aux_target_rob,
+        )
+
+    def dualpath_predict_with_pi(self, e_q, retrieved_y_enc, pi):
+        """RIDDE_检索扰动相对风险目标 (rob_doc)：h_i^r(pi) = sum_k pi_k * e_hat_k^r，
+        重跑P_inv/P_dyn/f_inv/f_dyn(以及idf_trr_dualpath_learnfuse的final_pred_head)。
+        e_q/retrieved_y_enc是缓存量(来自aux_e_q_rob/aux_retrieved_y_enc_rob)，不用
+        再过一次backbone/encode_mlp；这里只重跑轻量下游头，供ridde_robust_loss.py的
+        内层搜索反复调用。pi形状[batch, r_M]，跟aux_omega_rob(已squeeze)同形状，
+        sum(-1)应为1。
+        """
+        assert self.augment in ('idf_trr_dualpath', 'idf_trr_dualpath_learnfuse'), \
+            f"dualpath_predict_with_pi 只支持双路径augment_mode，收到 {self.augment}"
+        batch_size = pi.shape[0]
+        quantile_preds_shape = (batch_size, self.num_quantiles, self.chronos_config.prediction_length)
+        h_r = (pi.unsqueeze(-1) * retrieved_y_enc).sum(dim=1)
+        z_inv_in = torch.cat([e_q, h_r, e_q * h_r, torch.abs(e_q - h_r)], dim=-1)
+        z_dyn_in = torch.cat([e_q, e_q - h_r], dim=-1)
+        z_inv = self.P_inv(z_inv_in)
+        z_dyn = self.P_dyn(z_dyn_in)
+        y_inv = self.f_inv(z_inv).view(*quantile_preds_shape)
+        y_dyn = self.f_dyn(z_dyn).view(*quantile_preds_shape)
+        if self.augment == 'idf_trr_dualpath_learnfuse':
+            final_in = torch.cat([y_inv.reshape(batch_size, -1), y_dyn.reshape(batch_size, -1)], dim=-1)
+            fused = self.final_pred_head(final_in).view(*quantile_preds_shape)
+        else:
+            fused = y_inv + y_dyn
+        return fused
+
+    def _init_decoder(self, config):
+        decoder_config = copy.deepcopy(config)
+        decoder_config.is_decoder = True
+        decoder_config.is_encoder_decoder = False
+        decoder_config.num_layers = config.num_decoder_layers
+        self.decoder = T5Stack(decoder_config, self.shared)
+
+    def decode(
+        self,
+        input_embeds,
+        attention_mask,
+        hidden_states,
+        output_attentions=False,
+    ):
+        """
+        Parameters
+        ----------
+        input_embeds: torch.Tensor
+            Patched and embedded inputs. Shape (batch_size, patched_context_length, d_model)
+        attention_mask: torch.Tensor
+            Attention mask for the patched context. Shape (batch_size, patched_context_length), type: torch.int64
+        hidden_states: torch.Tensor
+            Hidden states returned by the encoder. Shape (batch_size, patched_context_length, d_model)
+
+        Returns
+        -------
+        last_hidden_state
+            Last hidden state returned by the decoder, of shape (batch_size, 1, d_model)
+        """
+        batch_size = input_embeds.shape[0]
+        decoder_input_ids = torch.full(
+            (batch_size, 1),
+            self.config.decoder_start_token_id,
+            device=input_embeds.device,
+        )
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            encoder_hidden_states=hidden_states,
+            encoder_attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            return_dict=True,
+        )
+
+        return decoder_outputs.last_hidden_state  # sequence_outputs, b x 1 x d_model
+
+
+class ChronosBoltPipelineWithRetrieval(BaseChronosPipeline):
+    forecast_type: ForecastType = ForecastType.QUANTILES
+    default_context_length: int = 2048
+    # register this class name with this alias for backward compatibility
+    _aliases = ["PatchedT5Pipeline"]
+
+    def __init__(self, model: ChronosBoltModelForForecastingWithRetrieval):
+        super().__init__(inner_model=model)
+        self.model = model
+
+    @property
+    def quantiles(self) -> List[float]:
+        return self.model.config.chronos_config["quantiles"]
+
+    def predict(  # type: ignore[override]
+        self,
+        context: Union[torch.Tensor, List[torch.Tensor]],
+        prediction_length: Optional[int] = None,
+        limit_prediction_length: bool = False,
+        retrieved_seq: Optional[torch.Tensor] = None,
+        distances: Optional[torch.Tensor] = None,
+    ):
+        context_tensor = self._prepare_and_validate_context(context=context)
+
+        model_context_length = self.model.config.chronos_config["context_length"]
+        model_prediction_length = self.model.config.chronos_config["prediction_length"]
+        if prediction_length is None:
+            prediction_length = model_prediction_length
+
+        if prediction_length > model_prediction_length:
+            msg = (
+                f"We recommend keeping prediction length <= {model_prediction_length}. "
+                "The quality of longer predictions may degrade since the model is not optimized for it. "
+            )
+            if limit_prediction_length:
+                msg += "You can turn off this check by setting `limit_prediction_length=False`."
+                raise ValueError(msg)
+            warnings.warn(msg)
+
+        predictions = []
+        remaining = prediction_length
+
+        # We truncate the context here because otherwise batches with very long
+        # context could take up large amounts of GPU memory unnecessarily.
+        if context_tensor.shape[-1] > model_context_length:
+            context_tensor = context_tensor[..., -model_context_length:]
+
+        # TODO: We unroll the forecast of Chronos Bolt greedily with the full forecast
+        # horizon that the model was trained with (i.e., 64). This results in variance collapsing
+        # every 64 steps.
+        while remaining > 0:
+            with torch.no_grad():
+                prediction = self.model(
+                    context=context_tensor.to(
+                        device=self.model.device,
+                        dtype=torch.float32,  # scaling should be done in 32-bit precision
+                    ),
+                    retrieved_seq = retrieved_seq,
+                    distances = distances,
+                ).quantile_preds.to(context_tensor)
+
+            predictions.append(prediction)
+            remaining -= prediction.shape[-1]
+
+            if remaining <= 0:
+                break
+
+            central_idx = torch.abs(torch.tensor(self.quantiles) - 0.5).argmin()
+            central_prediction = prediction[:, central_idx]
+
+            context_tensor = torch.cat([context_tensor, central_prediction], dim=-1)
+
+        return torch.cat(predictions, dim=-1)[..., :prediction_length]
+
+    def predict_quantiles(
+        self, context: torch.Tensor, prediction_length: int, quantile_levels: List[float],
+        retrieved_seq: Optional[torch.Tensor] = None,
+        distances: Optional[torch.Tensor] = None, **kwargs
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # shape (batch_size, prediction_length, len(training_quantile_levels))
+        predictions = (
+            self.predict(
+                context,
+                prediction_length=prediction_length,
+                retrieved_seq = retrieved_seq,
+                distances = distances,
+            )
+            .detach()
+            .cpu()
+            .swapaxes(1, 2)
+        )
+
+        training_quantile_levels = self.quantiles
+
+        if set(quantile_levels).issubset(set(training_quantile_levels)):
+            # no need to perform intra/extrapolation
+            quantiles = predictions[..., [training_quantile_levels.index(q) for q in quantile_levels]]
+        else:
+            # we rely on torch for interpolating quantiles if quantiles that
+            # Chronos Bolt was trained on were not provided
+            if min(quantile_levels) < min(training_quantile_levels) or max(quantile_levels) > max(
+                training_quantile_levels
+            ):
+                logger.warning(
+                    f"\tQuantiles to be predicted ({quantile_levels}) are not within the range of "
+                    f"quantiles that Chronos-Bolt was trained on ({training_quantile_levels}). "
+                    "Quantile predictions will be set to the minimum/maximum levels at which Chronos-Bolt "
+                    "was trained on. This may significantly affect the quality of the predictions."
+                )
+
+            # TODO: this is a hack that assumes the model's quantiles during training (training_quantile_levels)
+            # made up an equidistant grid along the quantile dimension. i.e., they were (0.1, 0.2, ..., 0.9).
+            # While this holds for official Chronos-Bolt models, this may not be true in the future, and this
+            # function may have to be revised.
+            augmented_predictions = torch.cat(
+                [predictions[..., [0]], predictions, predictions[..., [-1]]],
+                dim=-1,
+            )
+            quantiles = torch.quantile(
+                augmented_predictions, q=torch.tensor(quantile_levels, dtype=augmented_predictions.dtype), dim=-1
+            ).permute(1, 2, 0)
+        mean = predictions[:, :, training_quantile_levels.index(0.5)]
+        return quantiles, mean
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        """
+        Load the model, either from a local path or from the HuggingFace Hub.
+        Supports the same arguments as ``AutoConfig`` and ``AutoModel``
+        from ``transformers``.
+        """
+        # if optimization_strategy is provided, pop this as it won't be used
+        kwargs.pop("optimization_strategy", None)
+
+        config = AutoConfig.from_pretrained(*args, **kwargs)
+        assert hasattr(config, "chronos_config"), "Not a Chronos config file"
+
+        context_length = kwargs.pop("context_length", None)
+        if context_length is not None:
+            config.chronos_config["context_length"] = context_length
+
+        architecture = config.architectures[0]
+        class_ = globals().get(architecture)
+
+        # TODO: remove this once all models carry the correct architecture names in their configuration
+        # and raise an error instead.
+        if class_ is None:
+            logger.warning(f"Unknown architecture: {architecture}, defaulting to ChronosBoltModelForForecastingWithRetrieval")
+            class_ = ChronosBoltModelForForecastingWithRetrieval
+
+        model = class_.from_pretrained(*args, **kwargs)
+        return cls(model=model)
